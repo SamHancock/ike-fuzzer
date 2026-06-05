@@ -208,9 +208,9 @@ DH_GROUPS: dict[int, DHGroup] = {
     2:  DHGroup(2,  "1024-bit MODP",    "modp", 128),
     5:  DHGroup(5,  "1536-bit MODP",    "modp", 192),
     14: DHGroup(14, "2048-bit MODP",    "modp", 256),
-    19: DHGroup(19, "256-bit EC P-256", "ec",   65),
-    20: DHGroup(20, "384-bit EC P-384", "ec",   97),
-    21: DHGroup(21, "521-bit EC P-521", "ec",   133),
+    19: DHGroup(19, "256-bit EC P-256", "ec",   64),
+    20: DHGroup(20, "384-bit EC P-384", "ec",   96),
+    21: DHGroup(21, "521-bit EC P-521", "ec",   132),
 }
 
 # MODP group prime values (RFC 3526)
@@ -1253,10 +1253,12 @@ class IKEv2Client:
             _curves = {19: ec.SECP256R1(), 20: ec.SECP384R1(), 21: ec.SECP521R1()}
             priv = ec.generate_private_key(_curves[gid])
             self.dh_priv = priv
-            self.dh_pub  = priv.public_key().public_bytes(
+            # RFC 5903 §3: KE payload = x || y (strip 0x04 uncompressed-point prefix)
+            full = priv.public_key().public_bytes(
                 serialization.Encoding.X962,
                 serialization.PublicFormat.UncompressedPoint,
             )
+            self.dh_pub = full[1:]
 
         self.log.debug(f"DH public key ({len(self.dh_pub)} bytes):", self.dh_pub)
 
@@ -1279,8 +1281,9 @@ class IKEv2Client:
             self.dh_shared = pow(peer_int, self.dh_priv, p).to_bytes(key_bytes, "big")
         else:
             _curves  = {19: ec.SECP256R1(), 20: ec.SECP384R1(), 21: ec.SECP521R1()}
+            # Peer sends x || y (no 0x04 prefix) per RFC 5903 §3; restore it
             peer_key = EllipticCurvePublicKey.from_encoded_point(
-                _curves[gid], peer_pub_bytes
+                _curves[gid], b"\x04" + peer_pub_bytes
             )
             self.dh_shared = self.dh_priv.exchange(ec.ECDH(), peer_key)
 
@@ -2014,10 +2017,12 @@ class IKEv1Client:
             _curves = {19: ec.SECP256R1(), 20: ec.SECP384R1(), 21: ec.SECP521R1()}
             priv = ec.generate_private_key(_curves[gid])
             self.dh_priv = priv
-            self.dh_pub  = priv.public_key().public_bytes(
+            # RFC 5903 §3: KE payload = x || y (strip 0x04 uncompressed-point prefix)
+            full = priv.public_key().public_bytes(
                 serialization.Encoding.X962,
                 serialization.PublicFormat.UncompressedPoint,
             )
+            self.dh_pub = full[1:]
         self.log.debug(f"DH public key ({len(self.dh_pub)}B):", self.dh_pub)
 
     def _compute_dh_shared(self, peer_pub: bytes) -> None:
@@ -2031,7 +2036,8 @@ class IKEv1Client:
             ).to_bytes(key_bytes, "big")
         else:
             _curves  = {19: ec.SECP256R1(), 20: ec.SECP384R1(), 21: ec.SECP521R1()}
-            peer_key = EllipticCurvePublicKey.from_encoded_point(_curves[gid], peer_pub)
+            # Peer sends x || y (no 0x04 prefix) per RFC 5903 §3; restore it
+            peer_key = EllipticCurvePublicKey.from_encoded_point(_curves[gid], b"\x04" + peer_pub)
             self.dh_shared = self.dh_priv.exchange(ec.ECDH(), peer_key)
         self.log.debug(f"DH shared g^ir ({len(self.dh_shared)}B):", self.dh_shared)
 
