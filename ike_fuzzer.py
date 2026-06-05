@@ -66,9 +66,11 @@ class FuzzResult:
 
     @property
     def interesting(self) -> bool:
+        """True when an accepted or interesting verdict was not expected by the test case."""
         return self.verdict in ("interesting", "accepted") and self.case.expected != "accepted"
 
     def to_dict(self) -> dict:
+        """Serialise the result to a plain dict suitable for JSON output."""
         return {
             "seq":         self.case.seq,
             "name":        self.case.name,
@@ -89,32 +91,39 @@ class FuzzResult:
 # ---------------------------------------------------------------------------
 
 def _mutate(pkt: bytes, offset: int, new_bytes: bytes) -> bytes:
+    """Return a copy of `pkt` with `new_bytes` spliced in at `offset`."""
     return pkt[:offset] + new_bytes + pkt[offset + len(new_bytes):]
 
 
 def _set_u8(pkt: bytes, offset: int, val: int) -> bytes:
+    """Return a copy of `pkt` with a single byte overwritten at `offset`."""
     return _mutate(pkt, offset, bytes([val & 0xFF]))
 
 
 def _set_u16be(pkt: bytes, offset: int, val: int) -> bytes:
+    """Return a copy of `pkt` with a big-endian uint16 overwritten at `offset`."""
     return _mutate(pkt, offset, struct.pack("!H", val & 0xFFFF))
 
 
 def _set_u32be(pkt: bytes, offset: int, val: int) -> bytes:
+    """Return a copy of `pkt` with a big-endian uint32 overwritten at `offset`."""
     return _mutate(pkt, offset, struct.pack("!I", val & 0xFFFFFFFF))
 
 
 def _craft_transform(t_type: int, t_id: int, attrs: bytes = b"", last: bool = False) -> bytes:
+    """Build a raw IKEv2 Transform substructure (RFC 7296 §3.3.2)."""
     more   = 0 if last else 3
     length = 8 + len(attrs)
     return struct.pack("!BBHBBH", more, 0, length, t_type, 0, t_id) + attrs
 
 
 def _key_len_attr(bits: int) -> bytes:
+    """Build a Key Length (type 14) transform attribute for symmetric ciphers."""
     return struct.pack("!HH", 0x800E, bits)
 
 
 def _craft_proposal(proto_id: int, xforms: list[bytes], spi: bytes = b"") -> bytes:
+    """Build a raw IKEv2 Proposal substructure containing the given transforms."""
     trans_bytes = b"".join(xforms)
     prop_len    = 8 + len(spi) + len(trans_bytes)
     return (
@@ -126,17 +135,20 @@ def _craft_proposal(proto_id: int, xforms: list[bytes], spi: bytes = b"") -> byt
 
 def _craft_sa_payload(next_payload: int, proposal_bytes: bytes,
                       critical: bool = False) -> bytes:
+    """Wrap a serialised proposal in an SA payload generic header."""
     crit = 0x80 if critical else 0
     plen = 4 + len(proposal_bytes)
     return struct.pack("!BBH", next_payload, crit, plen) + proposal_bytes
 
 
 def _craft_ke_payload(next_payload: int, group: int, pubkey: bytes) -> bytes:
+    """Build a KE payload: generic header + DH group number + reserved + public key."""
     body = struct.pack("!HH", group, 0) + pubkey
     return struct.pack("!BBH", next_payload, 0, 4 + len(body)) + body
 
 
 def _craft_nonce_payload(next_payload: int, nonce: bytes) -> bytes:
+    """Build a Nonce payload: generic header + raw nonce bytes."""
     return struct.pack("!BBH", next_payload, 0, 4 + len(nonce)) + nonce
 
 
@@ -240,6 +252,7 @@ def gen_sa_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
     sa_len = struct.unpack("!H", base[30:32])[0]   # SA generic header length at offset 28
 
     def _replace_sa(sa_bytes: bytes) -> bytes:
+        """Splice `sa_bytes` in place of the original SA payload and patch total length."""
         # SA starts at byte 28; next payload of SA header is the old value
         # Preserve the next_payload chain by keeping the next field intact from the old SA header
         rest = base[28 + sa_len:]   # KE + Nonce payloads (unchanged)
@@ -249,6 +262,7 @@ def gen_sa_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
 
     # Reconstruct the "normal" set of transforms for reference
     def _normal_xforms(override_dh: Optional[int] = None) -> list[bytes]:
+        """Return the reference transform list for the configured algorithm set."""
         xf: list[bytes] = []
         kl = _key_len_attr(encr.key_len) if encr.transform_id != 3 else b""
         xf.append(_craft_transform(TRANSFORM_TYPE_ENCR, encr.transform_id, kl))
@@ -347,6 +361,7 @@ def gen_ke_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
     dh = cfg.dh_group
 
     def _replace_ke(ke_bytes: bytes) -> bytes:
+        """Splice `ke_bytes` in place of the original KE payload and patch total length."""
         before  = base[:ke_off]
         after   = base[ke_off + ke_len:]
         new_total = len(before) + len(ke_bytes) + len(after)
@@ -380,6 +395,7 @@ def gen_nonce_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
     ni_off = ke_off + ke_len     # byte offset of Nonce generic header
 
     def _replace_nonce(nonce_bytes: bytes) -> bytes:
+        """Splice `nonce_bytes` in place of the original Nonce payload and patch total length."""
         before = base[:ni_off]
         new_total = len(before) + len(nonce_bytes)
         return _set_u32be(before, 24, new_total) + nonce_bytes
@@ -641,10 +657,16 @@ def run_fuzzer(
     verbose:     bool,
     color:       bool,
 ) -> list[FuzzResult]:
+    """
+    Build fuzz cases from the selected strategies, send each to the responder,
+    classify the response, and return all FuzzResult objects.
 
+    Writes a JSON report to `report_path` if provided.
+    """
     use_color = color and sys.stdout.isatty()
 
     def _cprint(text: str, verdict: str) -> str:
+        """Apply ANSI colour to `text` based on verdict; no-op when colour is disabled."""
         if not use_color:
             return text
         return VERDICT_COLOR.get(verdict, "") + text + RESET
@@ -752,6 +774,7 @@ def run_fuzzer(
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build and return the CLI argument parser for ike_fuzzer.py."""
     p = argparse.ArgumentParser(
         prog="ike_fuzzer.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -805,6 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Parse CLI arguments and invoke run_fuzzer with the requested configuration."""
     parser = build_parser()
     args   = parser.parse_args()
 

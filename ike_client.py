@@ -218,6 +218,7 @@ MODP_PARAMS: dict[int, tuple[int, int]] = {}   # filled at module init below
 
 
 def _init_modp_params() -> None:
+    """Populate MODP_PARAMS with (prime, generator) for every supported DH group."""
     # Group 2: 1024-bit MODP (RFC 2409)
     MODP_PARAMS[2] = (
         int("FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1"
@@ -325,15 +326,18 @@ def _hex_dump(data: bytes, indent: int = 4) -> str:
 class Logger:
     def __init__(self, min_level: int = LogLevel.INFO, verbose: bool = False,
                  color: bool = True):
+        """Create a logger with timestamped, phase-tagged, optionally coloured output."""
         self.min_level = min_level
         self.verbose   = verbose
         self.color     = color and sys.stdout.isatty()
         self._phase    = "INIT"
 
     def set_phase(self, phase: str) -> None:
+        """Update the exchange-phase tag shown in every subsequent log line."""
         self._phase = phase
 
     def _emit(self, level: int, msg: str) -> None:
+        """Format and print one log line; no-op if level is below min_level."""
         if level < self.min_level:
             return
         ts    = time.strftime("%H:%M:%S")
@@ -345,32 +349,39 @@ class Logger:
         print(line, flush=True)
 
     def debug(self, msg: str, data: Optional[bytes] = None) -> None:
+        """Log at DEBUG level; hex-dump `data` if verbose mode is on."""
         self._emit(LogLevel.DEBUG, msg)
         if data is not None and self.verbose:
             print(_hex_dump(data))
 
     def info(self, msg: str, data: Optional[bytes] = None) -> None:
+        """Log at INFO level; hex-dump `data` if verbose mode is on."""
         self._emit(LogLevel.INFO, msg)
         if data is not None and self.verbose:
             print(_hex_dump(data))
 
     def warn(self, msg: str) -> None:
+        """Log at WARN level."""
         self._emit(LogLevel.WARN, msg)
 
     def error(self, msg: str) -> None:
+        """Log at ERROR level."""
         self._emit(LogLevel.ERROR, msg)
 
     def section(self, title: str) -> None:
+        """Print a full-width horizontal rule with a centred title."""
         bar = "─" * 60
         print(f"\n{bar}")
         print(f"  {title}")
         print(f"{bar}")
 
     def field(self, name: str, value, indent: int = 2) -> None:
+        """Log a named key = value pair at DEBUG level."""
         pad = " " * indent
         self._emit(LogLevel.DEBUG, f"{pad}{name:<28} = {value}")
 
     def hexfield(self, name: str, data: bytes, indent: int = 2) -> None:
+        """Log a named bytes field as a hex string at DEBUG level, with an optional hex dump."""
         hex_str = data.hex()
         self._emit(LogLevel.DEBUG, f"{' '*indent}{name:<28} = {hex_str}")
         if self.verbose and len(data) > 4:
@@ -402,6 +413,7 @@ class IKEConfig:
     dh_info:    DHGroup      = field(init=False)
 
     def __post_init__(self) -> None:
+        """Validate algorithm names and resolve them to their descriptor objects."""
         if self.encr not in ENCR_ALGORITHMS:
             raise ValueError(f"Unknown encryption algorithm: {self.encr!r}")
         if self.integ not in INTEG_ALGORITHMS and not ENCR_ALGORITHMS[self.encr].is_aead:
@@ -423,6 +435,7 @@ class IKEConfig:
 
 
 def _local_ip() -> str:
+    """Return the local IP address that would be used for outbound traffic."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -455,6 +468,7 @@ class IKEv1Config:
     dh_info:   DHGroup   = field(init=False)
 
     def __post_init__(self) -> None:
+        """Validate algorithm names and resolve them to their descriptor objects."""
         if self.encr not in V1_ENCR_ALGORITHMS:
             raise ValueError(
                 f"Unsupported IKEv1 encryption: {self.encr!r}. "
@@ -507,6 +521,7 @@ class IKEv2Client:
     """
 
     def __init__(self, cfg: IKEConfig) -> None:
+        """Initialise all IKE SA state to empty; no network I/O is performed here."""
         self.cfg  = cfg
         self.log  = Logger(
             min_level=LogLevel.DEBUG,
@@ -548,6 +563,7 @@ class IKEv2Client:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        """Execute the full IKEv2 exchange: IKE_SA_INIT → key derivation → IKE_AUTH."""
         self.log.section("IKEv2 Exchange Start")
         self.log.info(f"Target      : {self.cfg.host}:{self.cfg.port}")
         self.log.info(f"Encryption  : {self.cfg.encr}")
@@ -1032,10 +1048,6 @@ class IKEv2Client:
 
         return self._generic_payload_hdr(next_payload, prop_bytes) + prop_bytes
 
-    # ------------------------------------------------------------------
-    # Payload parsers  (Milestone 3)  ✓
-    # ------------------------------------------------------------------
-
     def _parse_payloads(self, data: bytes, first_payload_type: int) -> list[dict]:
         """
         Walk the IKEv2 generic payload chain.
@@ -1217,6 +1229,7 @@ class IKEv2Client:
 
     @staticmethod
     def _hash_fn(algo_name: str):
+        """Return the hashlib constructor for the given algorithm name string."""
         return {
             "md5":    hashlib.md5,
             "sha1":   hashlib.sha1,
@@ -1587,6 +1600,7 @@ class IKEv1Client:
     """
 
     def __init__(self, cfg: IKEv1Config) -> None:
+        """Initialise all ISAKMP SA state to empty; no network I/O is performed here."""
         self.cfg = cfg
         self.log = Logger(min_level=LogLevel.DEBUG, verbose=cfg.verbose, color=True)
 
@@ -1618,6 +1632,7 @@ class IKEv1Client:
     # ── Entry point ────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Open a persistent UDP socket and run the configured Phase 1 exchange mode."""
         self.log.section(f"IKEv1 Phase 1  [{self.cfg.mode.title()} Mode]")
         self.log.info(f"Target    : {self.cfg.host}:{self.cfg.port}")
         self.log.info(f"Encr      : {self.cfg.encr}")
@@ -1646,6 +1661,7 @@ class IKEv1Client:
     # ── Main Mode ──────────────────────────────────────────────────────────
 
     def _main_mode(self) -> None:
+        """Run the 6-message IKEv1 Main Mode exchange (RFC 2409 §5.4)."""
         # --- Messages 1 & 2: SA negotiation ---
         self.log.set_phase("MM-SA")
         sa_pld = self._build_sa_payload_v1(V1_PAYLOAD_NONE)
@@ -1743,6 +1759,7 @@ class IKEv1Client:
     # ── Aggressive Mode ────────────────────────────────────────────────────
 
     def _aggressive_mode(self) -> None:
+        """Run the 3-message IKEv1 Aggressive Mode exchange (RFC 2409 §5.4)."""
         # --- Message 1: SA + KE + Nonce + IDii ---
         self.log.set_phase("AGG-INIT")
         sa_pld    = self._build_sa_payload_v1(V1_PAYLOAD_KE)
@@ -1832,6 +1849,7 @@ class IKEv1Client:
 
     @staticmethod
     def _generic_hdr_v1(next_payload: int, data_len: int) -> bytes:
+        """Build a 4-byte ISAKMP generic payload header (next, reserved, length)."""
         return struct.pack("!BBH", next_payload, 0, 4 + data_len)
 
     def _build_generic_v1(self, next_payload: int, body: bytes,
@@ -1849,9 +1867,11 @@ class IKEv1Client:
 
         # Transform attributes (TV format unless noted)
         def _tv(attr_type: int, val: int) -> bytes:
+            """Encode a 2-byte type/value attribute (high bit set = TV format)."""
             return struct.pack("!HH", 0x8000 | attr_type, val)
 
         def _tlv(attr_type: int, data: bytes) -> bytes:
+            """Encode a variable-length type/length/value attribute."""
             return struct.pack("!HH", attr_type, len(data)) + data
 
         attrs  = _tv(V1_ATTR_ENCR, encr.encr_id)
@@ -1897,6 +1917,7 @@ class IKEv1Client:
     # ── Parsers ────────────────────────────────────────────────────────────
 
     def _parse_isakmp_hdr(self, pkt: bytes, expected_exch: int) -> None:
+        """Log ISAKMP header fields and raise if exchange type or version is wrong."""
         if len(pkt) < 28:
             raise ValueError(f"Packet too short: {len(pkt)}B")
         r_cookie_i = pkt[0:8]
@@ -1962,6 +1983,7 @@ class IKEv1Client:
                 aoff += 4 + a_len
 
     def _log_payloads_v1(self, payloads: list[dict]) -> None:
+        """Log each parsed ISAKMP payload with type, length, and key field values."""
         for i, p in enumerate(payloads):
             name = V1_PAYLOAD_NAMES.get(p["type"], f"?{p['type']}")
             self.log.debug(f"  [{i}] {name:<12} ({4 + len(p['data'])}B)")
@@ -1985,6 +2007,7 @@ class IKEv1Client:
 
     @staticmethod
     def _hash_fn_v1(algo: str):
+        """Return the hashlib constructor for the given IKEv1 hash algorithm name."""
         return {
             "md5": hashlib.md5, "sha1": hashlib.sha1,
             "sha256": hashlib.sha256, "sha512": hashlib.sha512,
@@ -2026,6 +2049,7 @@ class IKEv1Client:
         self.log.debug(f"DH public key ({len(self.dh_pub)}B):", self.dh_pub)
 
     def _compute_dh_shared(self, peer_pub: bytes) -> None:
+        """Compute g^ir from the peer's wire-format public key bytes; sets self.dh_shared."""
         gid  = self.cfg.dh_group
         info = self.cfg.dh_info
         if info.kind == "modp":
@@ -2156,6 +2180,7 @@ class IKEv1Client:
         return h
 
     def _verify_hash_r(self, received: bytes) -> None:
+        """Recompute HASH_R and log whether it matches the received value."""
         expected = self._compute_hash_r()
         if received == expected:
             self.log.info("HASH_R: VERIFIED ✓")
@@ -2169,6 +2194,7 @@ class IKEv1Client:
     # ── Network I/O ────────────────────────────────────────────────────────
 
     def _send_recv_v1(self, pkt: bytes) -> bytes:
+        """Send `pkt` over self._sock and block until a UDP response arrives."""
         dest = (self.cfg.host, self.cfg.port)
         self.log.debug(f"UDP → {dest[0]}:{dest[1]}  ({len(pkt)}B)")
         self._sock.sendto(pkt, dest)
@@ -2208,6 +2234,7 @@ def run_self_test() -> bool:
     failed = 0
 
     def check(label: str, got: bytes, want: bytes) -> None:
+        """Compare two byte strings and increment the pass/fail counters."""
         nonlocal passed, failed
         if got == want:
             print(f"  PASS  {label}")
@@ -2219,6 +2246,7 @@ def run_self_test() -> bool:
             failed += 1
 
     def _silent(cfg_kwargs: dict) -> "IKEv2Client":
+        """Construct an IKEv2Client with logging suppressed, for use in tests."""
         cfg = IKEConfig(**cfg_kwargs)
         c   = IKEv2Client(cfg)
         c.log.min_level = LogLevel.ERROR   # suppress output during test
@@ -2357,6 +2385,7 @@ def run_self_test() -> bool:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build and return the CLI argument parser for ike_client.py."""
     p = argparse.ArgumentParser(
         prog="ike_client.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2437,6 +2466,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Parse CLI arguments and run the requested IKEv1/IKEv2 exchange or self-test."""
     parser = build_parser()
     args   = parser.parse_args()
 
