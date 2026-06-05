@@ -1,14 +1,17 @@
-# IKEv2 Client & Fuzzer
+# IKEv1 / IKEv2 Client & Fuzzer
 
-Python 3 implementation of the IKEv2 initiator-side `IKE_SA_INIT` / `IKE_AUTH`
-exchange (RFC 7296) with PSK authentication, plus a structured protocol fuzzer.
+Python 3 implementation of IKEv1 and IKEv2 initiator-side exchanges with PSK
+authentication, plus a structured protocol fuzzer.
+
+- **IKEv2** (RFC 7296) — full `IKE_SA_INIT` / `IKE_AUTH` exchange
+- **IKEv1** (RFC 2408 / RFC 2409) — Phase 1 Main Mode (6-message) and Aggressive Mode (3-message)
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `ike_client.py` | IKEv2 client — full IKE_SA_INIT + IKE_AUTH exchange |
-| `ike_fuzzer.py` | Protocol fuzzer — structured and random mutations |
+| `ike_client.py` | IKEv1/IKEv2 client — select with `--version 1` or `--version 2` |
+| `ike_fuzzer.py` | Protocol fuzzer — structured and random mutations of IKE_SA_INIT |
 | `requirements.txt` | Python dependencies |
 
 ## Setup
@@ -270,6 +273,116 @@ Authentication uses PSK (RFC 7296 §2.15):
 ```
 AUTH = prf( prf(PSK, "Key Pad for IKEv2"), signed_octets )
 ```
+
+---
+
+## IKEv1 Client
+
+### Basic usage
+
+```bash
+venv/bin/python ike_client.py <host> --version 1 [options]
+```
+
+### IKEv1-specific options
+
+```
+--version 1               Select IKEv1 (default: 2)
+--mode {main,aggressive}  Phase 1 exchange mode (default: main)
+--hash ALG                Hash / PRF algorithm (default: sha1)
+--encr ALG                Encryption (default: aes-cbc-256)
+--dh-group N              DH group (default: 14)
+--psk PSK                 Pre-shared key
+--lifetime N              SA lifetime in seconds (default: 28800)
+```
+
+**Hash algorithms (`--hash`)**
+
+| Value | Algorithm |
+|-------|-----------|
+| `md5` | HMAC-MD5 |
+| `sha1` | HMAC-SHA1 *(default)* |
+| `sha256` | HMAC-SHA256 |
+| `sha512` | HMAC-SHA512 |
+
+**Encryption (`--encr`)** — IKEv1 supports: `3des`, `aes-cbc-128`, `aes-cbc-256`
+(AES-GCM is IKEv2-only)
+
+### Examples
+
+Default IKEv1 Main Mode (AES-256 + SHA-1 + DH-14):
+```bash
+venv/bin/python ike_client.py 10.0.0.1 --version 1 --psk "MySecret"
+```
+
+**AES-256 + SHA-512 + P-521 (DH group 21):**
+```bash
+venv/bin/python ike_client.py 10.0.0.1 --version 1 \
+    --encr aes-cbc-256 \
+    --hash sha512 \
+    --dh-group 21 \
+    --psk "MySecret"
+```
+
+Aggressive Mode with SHA-256:
+```bash
+venv/bin/python ike_client.py 10.0.0.1 --version 1 \
+    --mode aggressive \
+    --encr aes-cbc-256 \
+    --hash sha256 \
+    --dh-group 14 \
+    --psk "MySecret"
+```
+
+Legacy 3DES + MD5 (maximum compatibility):
+```bash
+venv/bin/python ike_client.py 10.0.0.1 --version 1 \
+    --encr 3des \
+    --hash md5 \
+    --dh-group 2 \
+    --psk "MySecret"
+```
+
+### IKEv1 Phase 1 exchange flow
+
+**Main Mode (6 messages):**
+```
+Initiator                                Responder
+─────────────────────────────────────────────────
+Msg 1: HDR + SA                ────────>
+                               <──────── Msg 2: HDR + SA (selected)
+Msg 3: HDR + KE + Ni           ────────>
+                               <──────── Msg 4: HDR + KE + Nr
+  [key derivation: SKEYID chain]
+Msg 5: HDR* + IDii + HASH_I   ────────>
+                               <──────── Msg 6: HDR* + IDir + HASH_R
+```
+
+**Aggressive Mode (3 messages):**
+```
+Initiator                                Responder
+─────────────────────────────────────────────────
+Msg 1: HDR + SA + KE + Ni + IDii ──────>
+                          <────────────── Msg 2: HDR + SA + KE + Nr + IDir + HASH_R
+  [key derivation]
+Msg 3: HDR* + HASH_I             ──────>
+```
+*(* = encrypted with the negotiated cipher)*
+
+### IKEv1 key derivation (PSK, RFC 2409 §5.1)
+
+```
+SKEYID   = prf(PSK,      Ni | Nr)
+SKEYID_d = prf(SKEYID,   g^ir | CKY-I | CKY-R | 0x00)
+SKEYID_a = prf(SKEYID,   SKEYID_d | g^ir | CKY-I | CKY-R | 0x01)
+SKEYID_e = prf(SKEYID,   SKEYID_a | g^ir | CKY-I | CKY-R | 0x02)
+
+HASH_I = prf(SKEYID, g^xi | g^xr | CKY-I | CKY-R | SAi_b | IDii_b)
+HASH_R = prf(SKEYID, g^xr | g^xi | CKY-R | CKY-I | SAi_b | IDir_b)
+```
+*(prf = HMAC with the negotiated hash algorithm)*
+
+---
 
 ## Dependencies
 

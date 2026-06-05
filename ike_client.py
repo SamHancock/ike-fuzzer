@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""IKEv2 client: performs IKE_SA_INIT / IKE_AUTH exchange with PSK authentication.
+"""IKEv1/IKEv2 client for IKE_SA_INIT / IKE_AUTH (v2) and Phase 1 Main/Aggressive Mode (v1).
 
 Usage:
-    python3 ike_client.py <host> [options]
+    python3 ike_client.py <host> [--version {1,2}] [options]
 
-RFC 7296 — Internet Key Exchange Protocol Version 2 (IKEv2)
+RFC 7296 — IKEv2   RFC 2408/2409 — IKEv1/ISAKMP
 """
 
 import argparse
@@ -81,6 +81,64 @@ NOTIFY_NAT_DETECTION_DESTINATION_IP = 16389
 NOTIFY_NO_PROPOSAL_CHOSEN           = 14
 NOTIFY_INVALID_KE_PAYLOAD           = 17
 NOTIFY_AUTHENTICATION_FAILED        = 24
+
+# ---------------------------------------------------------------------------
+# IKEv1 / ISAKMP constants  (RFC 2408, RFC 2409)
+# ---------------------------------------------------------------------------
+
+V1_EXCHANGE_MAIN       = 2
+V1_EXCHANGE_AGGRESSIVE = 4
+V1_EXCHANGE_INFO       = 5
+V1_EXCHANGE_QUICK      = 32
+
+V1_FLAG_ENCRYPTION = 0x01
+V1_FLAG_COMMIT     = 0x02
+
+# ISAKMP payload type codes (RFC 2408 §3.1)
+V1_PAYLOAD_NONE      = 0
+V1_PAYLOAD_SA        = 1
+V1_PAYLOAD_PROPOSAL  = 2
+V1_PAYLOAD_TRANSFORM = 3
+V1_PAYLOAD_KE        = 4
+V1_PAYLOAD_ID        = 5
+V1_PAYLOAD_HASH      = 8
+V1_PAYLOAD_NONCE     = 10
+V1_PAYLOAD_NOTIFY    = 11
+V1_PAYLOAD_VID       = 13
+
+V1_PAYLOAD_NAMES = {
+    0: "NONE", 1: "SA", 2: "Proposal", 3: "Transform",
+    4: "KE",   5: "ID", 8: "Hash",    10: "Nonce",
+    11: "Notify", 13: "VendorID",
+}
+
+# SA attribute types
+V1_ATTR_ENCR      = 1    # TV  Encryption Algorithm
+V1_ATTR_HASH      = 2    # TV  Hash Algorithm
+V1_ATTR_AUTH      = 3    # TV  Authentication Method
+V1_ATTR_GROUP     = 4    # TV  Group Description (DH)
+V1_ATTR_LIFE_TYPE = 11   # TV  Life Type (1=seconds)
+V1_ATTR_LIFE_DUR  = 12   # TLV Life Duration
+V1_ATTR_KEY_LEN   = 14   # TV  Key Length (AES only)
+
+# Encryption algorithm values (IANA)
+V1_ENCR_3DES    = 5
+V1_ENCR_AES_CBC = 7
+
+# Hash algorithm values (IANA / RFC 4868)
+V1_HASH_MD5    = 1
+V1_HASH_SHA1   = 2
+V1_HASH_SHA256 = 4
+V1_HASH_SHA512 = 6
+
+V1_AUTH_PSK       = 1
+V1_DOI_IPSEC      = 1
+V1_SITUATION_ID   = 1
+V1_PROTO_ISAKMP   = 1
+V1_XFORM_KEY_IKE  = 1   # KEY_IKE transform ID for Phase 1
+
+V1_ID_IPV4_ADDR = 1
+V1_ID_FQDN      = 2
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +257,41 @@ def _init_modp_params() -> None:
     )
 
 _init_modp_params()
+
+
+# ---------------------------------------------------------------------------
+# IKEv1 algorithm descriptors
+# ---------------------------------------------------------------------------
+
+@dataclass
+class V1EncrAlg:
+    name:      str
+    encr_id:   int    # ISAKMP attribute value
+    key_bits:  int    # attribute value sent in proposal (e.g. 256 for AES-256)
+    key_bytes: int    # actual cipher key length in bytes
+    block_len: int    # cipher block / IV size in bytes
+
+
+@dataclass
+class V1HashAlg:
+    name:       str
+    hash_id:    int   # ISAKMP attribute value
+    hash_algo:  str   # hashlib name
+    output_len: int   # digest bytes
+
+
+V1_ENCR_ALGORITHMS: dict[str, V1EncrAlg] = {
+    "3des":        V1EncrAlg("3des",        V1_ENCR_3DES,    192, 24, 8),
+    "aes-cbc-128": V1EncrAlg("aes-cbc-128", V1_ENCR_AES_CBC, 128, 16, 16),
+    "aes-cbc-256": V1EncrAlg("aes-cbc-256", V1_ENCR_AES_CBC, 256, 32, 16),
+}
+
+V1_HASH_ALGORITHMS: dict[str, V1HashAlg] = {
+    "md5":    V1HashAlg("md5",    V1_HASH_MD5,    "md5",    16),
+    "sha1":   V1HashAlg("sha1",   V1_HASH_SHA1,   "sha1",   20),
+    "sha256": V1HashAlg("sha256", V1_HASH_SHA256, "sha256", 32),
+    "sha512": V1HashAlg("sha512", V1_HASH_SHA512, "sha512", 64),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +431,53 @@ def _local_ip() -> str:
         return "0.0.0.0"
     finally:
         s.close()
+
+
+@dataclass
+class IKEv1Config:
+    """Configuration for an IKEv1 Phase 1 exchange (RFC 2409)."""
+    host:      str
+    mode:      str   = "main"       # "main" | "aggressive"
+    port:      int   = 500
+    encr:      str   = "aes-cbc-256"
+    hash_alg:  str   = "sha1"       # hash for both PRF and auth
+    dh_group:  int   = 14
+    psk:       str   = "secret"
+    id_local:  str   = ""
+    id_remote: str   = ""
+    lifetime:  int   = 28800        # seconds
+    timeout:   float = 5.0
+    verbose:   bool  = False
+
+    # resolved (filled by __post_init__)
+    encr_alg:  V1EncrAlg = field(init=False)
+    hash_info: V1HashAlg = field(init=False)
+    dh_info:   DHGroup   = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.encr not in V1_ENCR_ALGORITHMS:
+            raise ValueError(
+                f"Unsupported IKEv1 encryption: {self.encr!r}. "
+                f"Valid: {', '.join(V1_ENCR_ALGORITHMS)}"
+            )
+        if self.hash_alg not in V1_HASH_ALGORITHMS:
+            raise ValueError(
+                f"Unknown hash algorithm: {self.hash_alg!r}. "
+                f"Valid: {', '.join(V1_HASH_ALGORITHMS)}"
+            )
+        if self.dh_group not in DH_GROUPS:
+            raise ValueError(f"Unknown DH group: {self.dh_group}")
+        if self.mode not in ("main", "aggressive"):
+            raise ValueError(f"mode must be 'main' or 'aggressive', got {self.mode!r}")
+
+        self.encr_alg  = V1_ENCR_ALGORITHMS[self.encr]
+        self.hash_info = V1_HASH_ALGORITHMS[self.hash_alg]
+        self.dh_info   = DH_GROUPS[self.dh_group]
+
+        if not self.id_local:
+            self.id_local = _local_ip()
+        if not self.id_remote:
+            self.id_remote = self.host
 
 
 # Wildcard IPv4 Traffic Selector: TS_IPV4_ADDR_RANGE, proto=any, 0.0.0.0–255.255.255.255
@@ -1428,6 +1568,618 @@ class IKEv2Client:
 
 
 # ---------------------------------------------------------------------------
+# IKEv1Client  (RFC 2408 / RFC 2409)
+# ---------------------------------------------------------------------------
+
+class IKEv1Client:
+    """
+    IKEv1 Phase 1 initiator supporting both Main Mode (6-msg) and
+    Aggressive Mode (3-msg) with PSK authentication.
+
+    Key derivation (PSK, RFC 2409 §5.1):
+      SKEYID   = prf(PSK,    Ni | Nr)
+      SKEYID_d = prf(SKEYID, g^ir | CKY-I | CKY-R | 0x00)
+      SKEYID_a = prf(SKEYID, SKEYID_d | g^ir | CKY-I | CKY-R | 0x01)
+      SKEYID_e = prf(SKEYID, SKEYID_a | g^ir | CKY-I | CKY-R | 0x02)
+    """
+
+    def __init__(self, cfg: IKEv1Config) -> None:
+        self.cfg = cfg
+        self.log = Logger(min_level=LogLevel.DEBUG, verbose=cfg.verbose, color=True)
+
+        self.cookie_i:    bytes = os.urandom(8)
+        self.cookie_r:    bytes = b"\x00" * 8
+        self.nonce_i:     bytes = b""
+        self.nonce_r:     bytes = b""
+        self.dh_priv              = None
+        self.dh_pub:      bytes = b""
+        self.peer_dh_pub: bytes = b""
+        self.dh_shared:   bytes = b""
+
+        # Saved payloads for HASH_I/R computation
+        self.sa_payload_bytes:  bytes = b""  # full SA payload from msg 1
+        self.idi_payload_bytes: bytes = b""  # full IDii payload (hdr + body)
+        self.idr_payload_bytes: bytes = b""  # full IDir payload (hdr + body)
+
+        # Derived keys
+        self.skeyid:   bytes = b""
+        self.skeyid_d: bytes = b""
+        self.skeyid_a: bytes = b""
+        self.skeyid_e: bytes = b""
+        self.encr_key: bytes = b""
+        self.phase1_iv: bytes = b""
+
+    # ── Entry point ────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        self.log.section(f"IKEv1 Phase 1  [{self.cfg.mode.title()} Mode]")
+        self.log.info(f"Target    : {self.cfg.host}:{self.cfg.port}")
+        self.log.info(f"Encr      : {self.cfg.encr}")
+        self.log.info(f"Hash      : {self.cfg.hash_alg}")
+        self.log.info(f"DH group  : {self.cfg.dh_group} ({self.cfg.dh_info.name})")
+        self.log.info(f"Cookie I  : {self.cookie_i.hex()}")
+
+        self._generate_dh_keypair()
+        self.nonce_i = os.urandom(16)
+        self.log.info(f"Nonce I   : {self.nonce_i.hex()}")
+
+        if self.cfg.mode == "main":
+            self._main_mode()
+        else:
+            self._aggressive_mode()
+
+        self.log.section("IKEv1 Phase 1 Complete")
+        self.log.info("ISAKMP SA established")
+
+    # ── Main Mode ──────────────────────────────────────────────────────────
+
+    def _main_mode(self) -> None:
+        # --- Messages 1 & 2: SA negotiation ---
+        self.log.set_phase("MM-SA")
+        sa_pld = self._build_sa_payload_v1(V1_PAYLOAD_NONE)
+        self.sa_payload_bytes = sa_pld
+        pkt1 = self._build_isakmp_header(
+            V1_EXCHANGE_MAIN, 0, 0, V1_PAYLOAD_SA, 28 + len(sa_pld)
+        ) + sa_pld
+        self.log.info(f"Msg 1 → SA proposal ({len(pkt1)}B)")
+        self.log.debug("Raw msg 1:", pkt1)
+        resp2 = self._send_recv_v1(pkt1)
+        self._parse_mm_msg2(resp2)
+
+        # --- Messages 3 & 4: KE + Nonce ---
+        self.log.set_phase("MM-KE")
+        nonce_pld = self._build_generic_v1(V1_PAYLOAD_NONE, self.nonce_i)
+        ke_pld    = self._build_generic_v1(V1_PAYLOAD_NONCE, self.dh_pub)
+        pkt3 = self._build_isakmp_header(
+            V1_EXCHANGE_MAIN, 0, 0, V1_PAYLOAD_KE, 28 + len(ke_pld) + len(nonce_pld)
+        ) + ke_pld + nonce_pld
+        self.log.info(f"Msg 3 → KE + Nonce ({len(pkt3)}B)")
+        self.log.debug("Raw msg 3:", pkt3)
+        resp4 = self._send_recv_v1(pkt3)
+        self._parse_mm_msg4(resp4)
+
+        # Key derivation
+        self.log.set_phase("MM-KEYS")
+        self._derive_keys_v1()
+
+        # --- Messages 5 & 6: ID + HASH (encrypted) ---
+        self.log.set_phase("MM-AUTH")
+        idi_pld  = self._build_id_payload_v1(V1_PAYLOAD_NONE, self.cfg.id_local)
+        self.idi_payload_bytes = idi_pld
+        hash_i   = self._compute_hash_i()
+        hash_pld = self._build_generic_v1(V1_PAYLOAD_NONE, hash_i)
+        self.log.info(f"HASH_I = {hash_i.hex()}")
+
+        inner    = idi_pld + hash_pld
+        # Update first payload's next pointer: IDi → HASH
+        inner    = self._set_next_payload_v1(inner, 0, V1_PAYLOAD_HASH)
+        ct, new_iv = self._encrypt_v1(inner, self.phase1_iv)
+        pkt5 = self._build_isakmp_header(
+            V1_EXCHANGE_MAIN, V1_FLAG_ENCRYPTION, 0, V1_PAYLOAD_ID, 28 + len(ct)
+        ) + ct
+        self.log.info(f"Msg 5 → IDii + HASH_I (encrypted, {len(pkt5)}B)")
+        self.log.debug("Raw msg 5:", pkt5)
+
+        resp6 = self._send_recv_v1(pkt5)
+        self._parse_mm_msg6(resp6, new_iv)
+
+    def _parse_mm_msg2(self, pkt: bytes) -> None:
+        """Parse SA response; extract cookie_r and selected transform."""
+        self._parse_isakmp_hdr(pkt, expected_exch=V1_EXCHANGE_MAIN)
+        self.cookie_r = pkt[8:16]
+        self.log.info(f"Cookie R  : {self.cookie_r.hex()}")
+        payloads = self._parse_payloads_v1(pkt[28:], pkt[16])
+        self._log_payloads_v1(payloads)
+        for p in payloads:
+            if p["type"] == V1_PAYLOAD_SA:
+                self._parse_sa_response_v1(p["data"])
+
+    def _parse_mm_msg4(self, pkt: bytes) -> None:
+        """Parse KE + Nr; compute DH shared secret."""
+        self._parse_isakmp_hdr(pkt, expected_exch=V1_EXCHANGE_MAIN)
+        payloads = self._parse_payloads_v1(pkt[28:], pkt[16])
+        self._log_payloads_v1(payloads)
+        for p in payloads:
+            if p["type"] == V1_PAYLOAD_KE:
+                self.peer_dh_pub = p["data"]
+                self.log.debug(
+                    f"Peer DH pub ({len(self.peer_dh_pub)}B):", self.peer_dh_pub
+                )
+            elif p["type"] == V1_PAYLOAD_NONCE:
+                self.nonce_r = p["data"]
+                self.log.info(f"Nonce R   : {self.nonce_r.hex()}")
+        if not self.peer_dh_pub:
+            raise ValueError("No KE payload in IKEv1 message 4")
+        self._compute_dh_shared(self.peer_dh_pub)
+
+    def _parse_mm_msg6(self, pkt: bytes, iv: bytes) -> None:
+        """Decrypt and verify HASH_R from message 6."""
+        self._parse_isakmp_hdr(pkt, expected_exch=V1_EXCHANGE_MAIN)
+        if not (pkt[19] & V1_FLAG_ENCRYPTION):
+            raise ValueError("Message 6 is not encrypted")
+        plaintext, _ = self._decrypt_v1(pkt[28:], iv)
+        payloads = self._parse_payloads_v1(plaintext, pkt[16])
+        self._log_payloads_v1(payloads)
+        for p in payloads:
+            if p["type"] == V1_PAYLOAD_ID:
+                self.idr_payload_bytes = (
+                    struct.pack("!BBH", V1_PAYLOAD_NONE, 0, 4 + len(p["data"])) + p["data"]
+                )
+            elif p["type"] == V1_PAYLOAD_HASH:
+                self._verify_hash_r(p["data"])
+
+    # ── Aggressive Mode ────────────────────────────────────────────────────
+
+    def _aggressive_mode(self) -> None:
+        # --- Message 1: SA + KE + Nonce + IDii ---
+        self.log.set_phase("AGG-INIT")
+        sa_pld    = self._build_sa_payload_v1(V1_PAYLOAD_KE)
+        self.sa_payload_bytes = self._build_sa_payload_v1(V1_PAYLOAD_NONE)  # chain-free copy
+        ke_pld    = self._build_generic_v1(V1_PAYLOAD_NONCE, self.dh_pub,
+                                           ptype=V1_PAYLOAD_KE)
+        nonce_pld = self._build_generic_v1(V1_PAYLOAD_ID, self.nonce_i,
+                                           ptype=V1_PAYLOAD_NONCE)
+        idi_pld   = self._build_id_payload_v1(V1_PAYLOAD_NONE, self.cfg.id_local)
+        self.idi_payload_bytes = idi_pld
+
+        # Rebuild SA with correct next_payload chain
+        sa_pld = self._build_sa_payload_v1(V1_PAYLOAD_KE)
+        payloads = sa_pld + ke_pld + nonce_pld + idi_pld
+        pkt1 = self._build_isakmp_header(
+            V1_EXCHANGE_AGGRESSIVE, 0, 0, V1_PAYLOAD_SA, 28 + len(payloads)
+        ) + payloads
+        self.log.info(f"Msg 1 → SA + KE + Nonce + IDii ({len(pkt1)}B)")
+        self.log.debug("Raw msg 1:", pkt1)
+
+        resp2 = self._send_recv_v1(pkt1)
+        self._parse_agg_msg2(resp2)
+
+        # Key derivation (now have g^ir)
+        self.log.set_phase("AGG-KEYS")
+        self._derive_keys_v1()
+
+        # --- Message 3: HASH_I (encrypted) ---
+        self.log.set_phase("AGG-AUTH")
+        hash_i   = self._compute_hash_i()
+        hash_pld = self._build_generic_v1(V1_PAYLOAD_NONE, hash_i)
+        self.log.info(f"HASH_I = {hash_i.hex()}")
+        ct, _ = self._encrypt_v1(hash_pld, self.phase1_iv)
+        pkt3 = self._build_isakmp_header(
+            V1_EXCHANGE_AGGRESSIVE, V1_FLAG_ENCRYPTION, 0, V1_PAYLOAD_HASH, 28 + len(ct)
+        ) + ct
+        self.log.info(f"Msg 3 → HASH_I (encrypted, {len(pkt3)}B)")
+        self.log.debug("Raw msg 3:", pkt3)
+        self._send_no_wait_v1(pkt3)
+
+    def _parse_agg_msg2(self, pkt: bytes) -> None:
+        """Parse SA + KE + Nr + IDir + HASH_R from Aggressive Mode message 2."""
+        self._parse_isakmp_hdr(pkt, expected_exch=V1_EXCHANGE_AGGRESSIVE)
+        self.cookie_r = pkt[8:16]
+        self.log.info(f"Cookie R  : {self.cookie_r.hex()}")
+        payloads = self._parse_payloads_v1(pkt[28:], pkt[16])
+        self._log_payloads_v1(payloads)
+        hash_r_data = None
+        for p in payloads:
+            if p["type"] == V1_PAYLOAD_SA:
+                self._parse_sa_response_v1(p["data"])
+            elif p["type"] == V1_PAYLOAD_KE:
+                self.peer_dh_pub = p["data"]
+                self.log.debug(f"Peer DH pub ({len(self.peer_dh_pub)}B):", self.peer_dh_pub)
+            elif p["type"] == V1_PAYLOAD_NONCE:
+                self.nonce_r = p["data"]
+                self.log.info(f"Nonce R   : {self.nonce_r.hex()}")
+            elif p["type"] == V1_PAYLOAD_ID:
+                self.idr_payload_bytes = (
+                    struct.pack("!BBH", V1_PAYLOAD_NONE, 0, 4 + len(p["data"])) + p["data"]
+                )
+            elif p["type"] == V1_PAYLOAD_HASH:
+                hash_r_data = p["data"]
+        if not self.peer_dh_pub:
+            raise ValueError("No KE payload in Aggressive Mode message 2")
+        self._compute_dh_shared(self.peer_dh_pub)
+        # HASH_R verification happens after key derivation in run()
+        # Store for later
+        self._pending_hash_r = hash_r_data
+
+    # ── Packet builders ────────────────────────────────────────────────────
+
+    def _build_isakmp_header(self, exch_type: int, flags: int,
+                              msg_id: int, next_payload: int,
+                              total_len: int) -> bytes:
+        """28-byte ISAKMP header (RFC 2408 §3.1). Version = 0x10 (IKEv1)."""
+        return struct.pack(
+            "!8s8sBBBBII",
+            self.cookie_i, self.cookie_r,
+            next_payload,
+            0x10,        # IKEv1 version
+            exch_type,
+            flags,
+            msg_id,
+            total_len,
+        )
+
+    @staticmethod
+    def _generic_hdr_v1(next_payload: int, data_len: int) -> bytes:
+        return struct.pack("!BBH", next_payload, 0, 4 + data_len)
+
+    def _build_generic_v1(self, next_payload: int, body: bytes,
+                           ptype: int = 0) -> bytes:
+        """Build a generic ISAKMP payload header + body. ptype unused (caller sets chain)."""
+        return self._generic_hdr_v1(next_payload, len(body)) + body
+
+    def _build_sa_payload_v1(self, next_payload: int) -> bytes:
+        """
+        Build ISAKMP SA payload for Phase 1 (RFC 2409 §5.1):
+          SA { DOI | Situation | Proposal { Transform { Attributes } } }
+        """
+        encr  = self.cfg.encr_alg
+        hinfo = self.cfg.hash_info
+
+        # Transform attributes (TV format unless noted)
+        def _tv(attr_type: int, val: int) -> bytes:
+            return struct.pack("!HH", 0x8000 | attr_type, val)
+
+        def _tlv(attr_type: int, data: bytes) -> bytes:
+            return struct.pack("!HH", attr_type, len(data)) + data
+
+        attrs  = _tv(V1_ATTR_ENCR, encr.encr_id)
+        if encr.encr_id == V1_ENCR_AES_CBC:
+            attrs += _tv(V1_ATTR_KEY_LEN, encr.key_bits)
+        attrs += _tv(V1_ATTR_HASH,      hinfo.hash_id)
+        attrs += _tv(V1_ATTR_AUTH,      V1_AUTH_PSK)
+        attrs += _tv(V1_ATTR_GROUP,     self.cfg.dh_group)
+        attrs += _tv(V1_ATTR_LIFE_TYPE, 1)                          # seconds
+        attrs += _tlv(V1_ATTR_LIFE_DUR, struct.pack("!I", self.cfg.lifetime))
+
+        # Transform substructure
+        xform_body = struct.pack("!BBHH", 1, V1_XFORM_KEY_IKE, 0, 0) + attrs
+        xform = struct.pack("!BBH", 0, 0, 8 + len(xform_body)) + xform_body
+
+        # Proposal substructure: last=0, reserved, len, num=1, proto=ISAKMP, spi_size=0, n_xforms=1
+        prop_body = struct.pack("!BBBB", 1, V1_PROTO_ISAKMP, 0, 1) + xform
+        proposal  = struct.pack("!BBH", 0, 0, 4 + len(prop_body)) + prop_body
+
+        # SA body: DOI (4) + Situation (4) + proposal
+        sa_body = struct.pack("!II", V1_DOI_IPSEC, V1_SITUATION_ID) + proposal
+        return struct.pack("!BBH", next_payload, 0, 4 + len(sa_body)) + sa_body
+
+    def _build_id_payload_v1(self, next_payload: int, id_str: str) -> bytes:
+        """Build an ISAKMP ID payload. Auto-detects IPv4 vs FQDN."""
+        try:
+            ipaddress.IPv4Address(id_str)
+            id_type = V1_ID_IPV4_ADDR
+            id_data = socket.inet_aton(id_str)
+        except ValueError:
+            id_type = V1_ID_FQDN
+            id_data = id_str.encode()
+        # ID body: ID_type(1) + DOI_specific(3) + id_data
+        body = struct.pack("!BBBB", id_type, 0, 0, 0) + id_data
+        return struct.pack("!BBH", next_payload, 0, 4 + len(body)) + body
+
+    @staticmethod
+    def _set_next_payload_v1(payloads_bytes: bytes, offset: int, nxt: int) -> bytes:
+        """Patch the next_payload byte of the payload at `offset`."""
+        return payloads_bytes[:offset] + bytes([nxt]) + payloads_bytes[offset + 1:]
+
+    # ── Parsers ────────────────────────────────────────────────────────────
+
+    def _parse_isakmp_hdr(self, pkt: bytes, expected_exch: int) -> None:
+        if len(pkt) < 28:
+            raise ValueError(f"Packet too short: {len(pkt)}B")
+        r_cookie_i = pkt[0:8]
+        r_ver      = pkt[17]
+        r_exch     = pkt[18]
+        r_flags    = pkt[19]
+        r_len      = struct.unpack("!I", pkt[24:28])[0]
+        self.log.debug(f"  Cookie I  : {r_cookie_i.hex()}")
+        self.log.debug(f"  Cookie R  : {pkt[8:16].hex()}")
+        self.log.debug(f"  Version   : 0x{r_ver:02x}")
+        self.log.debug(f"  Exch type : {r_exch}")
+        self.log.debug(f"  Flags     : 0x{r_flags:02x}")
+        self.log.debug(f"  Length    : {r_len}  (received {len(pkt)}B)")
+        if r_ver != 0x10:
+            self.log.warn(f"Unexpected IKE version 0x{r_ver:02x} (expected 0x10)")
+        if r_exch != expected_exch:
+            raise ValueError(f"Expected exchange type {expected_exch}, got {r_exch}")
+
+    def _parse_payloads_v1(self, data: bytes, first_type: int) -> list[dict]:
+        """Walk ISAKMP generic payload chain. Returns [{type, data}]."""
+        payloads: list[dict] = []
+        cur  = first_type
+        off  = 0
+        while cur != V1_PAYLOAD_NONE and off + 4 <= len(data):
+            nxt  = data[off]
+            plen = struct.unpack("!H", data[off + 2:off + 4])[0]
+            if plen < 4 or off + plen > len(data):
+                self.log.warn(f"Invalid payload length {plen} at offset {off}")
+                break
+            payloads.append({"type": cur, "data": data[off + 4:off + plen]})
+            off += plen
+            cur  = nxt
+        return payloads
+
+    def _parse_sa_response_v1(self, sa_body: bytes) -> None:
+        """Log the selected transform from the SA response."""
+        if len(sa_body) < 12:
+            return
+        # Skip DOI(4) + Situation(4) + proposal header(4)
+        off = 12
+        if off + 4 > len(sa_body):
+            return
+        # Transform header: next(1) res(1) len(2) num(1) id(1) res(2)
+        if off + 8 > len(sa_body):
+            return
+        xform_len = struct.unpack("!H", sa_body[off + 2:off + 4])[0]
+        xform_id  = sa_body[off + 5]
+        self.log.info(f"Selected transform: {xform_id} (KEY_IKE)")
+        # Parse attributes
+        aoff = off + 8
+        while aoff + 4 <= off + xform_len:
+            a_type = struct.unpack("!H", sa_body[aoff:aoff + 2])[0]
+            if a_type & 0x8000:
+                a_val = struct.unpack("!H", sa_body[aoff + 2:aoff + 4])[0]
+                a_name = {
+                    0x8001: "ENCR", 0x8002: "HASH", 0x8003: "AUTH",
+                    0x8004: "GROUP", 0x800B: "LIFE_TYPE", 0x800E: "KEY_LEN",
+                }.get(a_type, f"attr-{a_type:#06x}")
+                self.log.debug(f"  {a_name:<12} = {a_val}")
+                aoff += 4
+            else:
+                a_len = struct.unpack("!H", sa_body[aoff + 2:aoff + 4])[0]
+                aoff += 4 + a_len
+
+    def _log_payloads_v1(self, payloads: list[dict]) -> None:
+        for i, p in enumerate(payloads):
+            name = V1_PAYLOAD_NAMES.get(p["type"], f"?{p['type']}")
+            self.log.debug(f"  [{i}] {name:<12} ({4 + len(p['data'])}B)")
+            if p["type"] == V1_PAYLOAD_NONCE:
+                self.log.debug(f"       nonce = {p['data'].hex()}")
+            elif p["type"] == V1_PAYLOAD_HASH:
+                self.log.debug(f"       hash  = {p['data'].hex()}")
+            elif p["type"] == V1_PAYLOAD_ID and p["data"]:
+                id_type = p["data"][0]
+                id_val  = p["data"][4:]
+                try:
+                    s = socket.inet_ntoa(id_val) if id_type == 1 else id_val.decode()
+                except Exception:
+                    s = id_val.hex()
+                self.log.debug(f"       ID    type={id_type}  {s!r}")
+            elif p["type"] == V1_PAYLOAD_NOTIFY and len(p["data"]) >= 4:
+                n_type = struct.unpack("!H", p["data"][2:4])[0]
+                self.log.debug(f"       notify type={n_type}")
+
+    # ── Crypto ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hash_fn_v1(algo: str):
+        return {
+            "md5": hashlib.md5, "sha1": hashlib.sha1,
+            "sha256": hashlib.sha256, "sha512": hashlib.sha512,
+        }[algo]
+
+    def _prf_v1(self, key: bytes, data: bytes) -> bytes:
+        """HMAC using the negotiated IKEv1 hash algorithm."""
+        h   = self._hash_fn_v1(self.cfg.hash_info.hash_algo)
+        out = _hmac.new(key, data, h).digest()
+        self.log.debug(f"prf_v1 key[0:4]={key[:4].hex()} → {out.hex()}")
+        return out
+
+    def _hash_raw_v1(self, data: bytes) -> bytes:
+        """Plain (non-keyed) hash using the negotiated algorithm."""
+        h = self._hash_fn_v1(self.cfg.hash_info.hash_algo)
+        return h(data).digest()
+
+    def _generate_dh_keypair(self) -> None:
+        """Generate DH keypair (shared with IKEv2 logic, same MODP/EC groups)."""
+        gid  = self.cfg.dh_group
+        info = self.cfg.dh_info
+        self.log.debug(f"Generating DH keypair: group {gid} ({info.name})")
+        if info.kind == "modp":
+            p, g      = MODP_PARAMS[gid]
+            key_bytes = info.pub_key_len
+            x         = int.from_bytes(os.urandom(key_bytes), "big") % (p - 2) + 2
+            self.dh_priv = x
+            self.dh_pub  = pow(g, x, p).to_bytes(key_bytes, "big")
+        else:
+            _curves = {19: ec.SECP256R1(), 20: ec.SECP384R1(), 21: ec.SECP521R1()}
+            priv = ec.generate_private_key(_curves[gid])
+            self.dh_priv = priv
+            self.dh_pub  = priv.public_key().public_bytes(
+                serialization.Encoding.X962,
+                serialization.PublicFormat.UncompressedPoint,
+            )
+        self.log.debug(f"DH public key ({len(self.dh_pub)}B):", self.dh_pub)
+
+    def _compute_dh_shared(self, peer_pub: bytes) -> None:
+        gid  = self.cfg.dh_group
+        info = self.cfg.dh_info
+        if info.kind == "modp":
+            p, _     = MODP_PARAMS[gid]
+            key_bytes = info.pub_key_len
+            self.dh_shared = pow(
+                int.from_bytes(peer_pub, "big"), self.dh_priv, p
+            ).to_bytes(key_bytes, "big")
+        else:
+            _curves  = {19: ec.SECP256R1(), 20: ec.SECP384R1(), 21: ec.SECP521R1()}
+            peer_key = EllipticCurvePublicKey.from_encoded_point(_curves[gid], peer_pub)
+            self.dh_shared = self.dh_priv.exchange(ec.ECDH(), peer_key)
+        self.log.debug(f"DH shared g^ir ({len(self.dh_shared)}B):", self.dh_shared)
+
+    def _derive_keys_v1(self) -> None:
+        """Derive SKEYID chain per RFC 2409 §5.1 (PSK)."""
+        self.log.section("IKEv1 Key Derivation (RFC 2409 §5.1)")
+        psk = self.cfg.psk.encode()
+
+        self.skeyid   = self._prf_v1(psk, self.nonce_i + self.nonce_r)
+        self.skeyid_d = self._prf_v1(
+            self.skeyid, self.dh_shared + self.cookie_i + self.cookie_r + b"\x00"
+        )
+        self.skeyid_a = self._prf_v1(
+            self.skeyid,
+            self.skeyid_d + self.dh_shared + self.cookie_i + self.cookie_r + b"\x01"
+        )
+        self.skeyid_e = self._prf_v1(
+            self.skeyid,
+            self.skeyid_a + self.dh_shared + self.cookie_i + self.cookie_r + b"\x02"
+        )
+
+        self.log.info(f"SKEYID   = {self.skeyid.hex()}")
+        self.log.info(f"SKEYID_d = {self.skeyid_d.hex()}")
+        self.log.info(f"SKEYID_a = {self.skeyid_a.hex()}")
+        self.log.info(f"SKEYID_e = {self.skeyid_e.hex()}")
+
+        self.encr_key  = self._derive_encr_key_v1()
+        self.phase1_iv = self._derive_iv_v1()
+        self.log.info(f"Encr key ({len(self.encr_key)}B) = {self.encr_key.hex()}")
+        self.log.info(f"Phase1 IV ({len(self.phase1_iv)}B) = {self.phase1_iv.hex()}")
+
+        # Verify HASH_R in Aggressive Mode (deferred until after key derivation)
+        if hasattr(self, "_pending_hash_r") and self._pending_hash_r is not None:
+            self._verify_hash_r(self._pending_hash_r)
+
+    def _derive_encr_key_v1(self) -> bytes:
+        """Derive cipher key from SKEYID_e, expanding via prf if needed."""
+        need = self.cfg.encr_alg.key_bytes
+        if len(self.skeyid_e) >= need:
+            return self.skeyid_e[:need]
+        # Expansion: K1=prf(SKEYID_e, 0x00), K2=prf(SKEYID_e, K1), ...
+        key_mat = b""
+        t       = b"\x00"
+        while len(key_mat) < need:
+            t        = self._prf_v1(self.skeyid_e, t)
+            key_mat += t
+        return key_mat[:need]
+
+    def _derive_iv_v1(self) -> bytes:
+        """IV for the first encrypted Phase 1 message = hash(g^xi | g^xr)."""
+        block = self.cfg.encr_alg.block_len
+        return self._hash_raw_v1(self.dh_pub + self.peer_dh_pub)[:block]
+
+    def _encrypt_v1(self, plaintext: bytes, iv: bytes) -> tuple[bytes, bytes]:
+        """
+        Pad and encrypt `plaintext` with the negotiated cipher.
+        Returns (ciphertext, new_iv) where new_iv is the last ciphertext block
+        (used as IV for the next encrypted message in the same exchange).
+        """
+        encr  = self.cfg.encr_alg
+        blk   = encr.block_len
+        # (len + pad_bytes + 1 pad_len_byte) must be a multiple of blk
+        pad   = (blk - ((len(plaintext) + 1) % blk)) % blk
+        plain = plaintext + bytes(pad) + bytes([pad])
+
+        if encr.encr_id == V1_ENCR_3DES:
+            cipher_obj = Cipher(_TripleDES(self.encr_key), modes.CBC(iv))
+        else:
+            cipher_obj = Cipher(cipher_algorithms.AES(self.encr_key), modes.CBC(iv))
+        enc        = cipher_obj.encryptor()
+        ciphertext = enc.update(plain) + enc.finalize()
+        new_iv     = ciphertext[-blk:]
+        self.log.debug(f"encrypt_v1: pad={pad}B plain={len(plain)}B ct={len(ciphertext)}B")
+        return ciphertext, new_iv
+
+    def _decrypt_v1(self, ciphertext: bytes, iv: bytes) -> tuple[bytes, bytes]:
+        """Decrypt and strip padding. Returns (plaintext, new_iv)."""
+        encr = self.cfg.encr_alg
+        blk  = encr.block_len
+        new_iv = ciphertext[-blk:]
+        if encr.encr_id == V1_ENCR_3DES:
+            cipher_obj = Cipher(_TripleDES(self.encr_key), modes.CBC(iv))
+        else:
+            cipher_obj = Cipher(cipher_algorithms.AES(self.encr_key), modes.CBC(iv))
+        dec    = cipher_obj.decryptor()
+        padded = dec.update(ciphertext) + dec.finalize()
+        pad    = padded[-1]
+        return padded[:-(pad + 1)], new_iv
+
+    def _compute_hash_i(self) -> bytes:
+        """
+        HASH_I = prf(SKEYID, g^xi | g^xr | CKY-I | CKY-R | SAi_b | IDii_b)
+        g^xi = dh_pub (initiator), g^xr = peer_dh_pub (responder).
+        SAi_b / IDii_b include their generic payload headers.
+        """
+        data = (self.dh_pub + self.peer_dh_pub
+                + self.cookie_i + self.cookie_r
+                + self.sa_payload_bytes
+                + self.idi_payload_bytes)
+        h = self._prf_v1(self.skeyid, data)
+        self.log.debug(f"HASH_I = {h.hex()}")
+        return h
+
+    def _compute_hash_r(self) -> bytes:
+        """
+        HASH_R = prf(SKEYID, g^xr | g^xi | CKY-R | CKY-I | SAi_b | IDir_b)
+        """
+        data = (self.peer_dh_pub + self.dh_pub
+                + self.cookie_r + self.cookie_i
+                + self.sa_payload_bytes
+                + self.idr_payload_bytes)
+        h = self._prf_v1(self.skeyid, data)
+        self.log.debug(f"HASH_R (expected) = {h.hex()}")
+        return h
+
+    def _verify_hash_r(self, received: bytes) -> None:
+        expected = self._compute_hash_r()
+        if received == expected:
+            self.log.info("HASH_R: VERIFIED ✓")
+        else:
+            self.log.warn(
+                f"HASH_R mismatch\n"
+                f"  expected : {expected.hex()}\n"
+                f"  received : {received.hex()}"
+            )
+
+    # ── Network I/O ────────────────────────────────────────────────────────
+
+    def _send_recv_v1(self, pkt: bytes) -> bytes:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(self.cfg.timeout)
+        try:
+            dest = (self.cfg.host, self.cfg.port)
+            self.log.debug(f"UDP → {dest[0]}:{dest[1]}  ({len(pkt)}B)")
+            sock.sendto(pkt, dest)
+            data, addr = sock.recvfrom(65535)
+            self.log.debug(f"UDP ← {addr[0]}:{addr[1]}  ({len(data)}B)")
+            self.log.debug("Raw response:", data)
+            return data
+        except socket.timeout:
+            raise TimeoutError(
+                f"No IKEv1 response from {self.cfg.host}:{self.cfg.port} "
+                f"within {self.cfg.timeout}s"
+            ) from None
+        finally:
+            sock.close()
+
+    def _send_no_wait_v1(self, pkt: bytes) -> None:
+        """Fire-and-forget UDP send (used for Aggressive Mode message 3)."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.log.debug(f"UDP → {self.cfg.host}:{self.cfg.port}  ({len(pkt)}B) [no-wait]")
+            sock.sendto(pkt, (self.cfg.host, self.cfg.port))
+        finally:
+            sock.close()
+
+
+# ---------------------------------------------------------------------------
 # Self-test  (Milestone 2)
 # ---------------------------------------------------------------------------
 
@@ -1599,41 +2351,61 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ike_client.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent("""\
-            IKEv2 client — performs IKE_SA_INIT / IKE_AUTH with PSK authentication.
+            IKEv1/IKEv2 client with PSK authentication.
 
-            Examples:
+            IKEv2 examples:
               %(prog)s 10.0.0.1
               %(prog)s 10.0.0.1 --encr aes-gcm-256 --dh-group 19
-              %(prog)s 10.0.0.1 --encr 3des --integ hmac-sha1-96 --prf hmac-sha1 --dh-group 5
+              %(prog)s 10.0.0.1 --encr aes-cbc-256 --integ hmac-sha512-256 --prf hmac-sha512 --dh-group 21
+
+            IKEv1 examples:
+              %(prog)s 10.0.0.1 --version 1
+              %(prog)s 10.0.0.1 --version 1 --mode aggressive
+              %(prog)s 10.0.0.1 --version 1 --encr aes-cbc-256 --hash sha512 --dh-group 21
         """),
     )
 
     p.add_argument("host", nargs="?", help="Responder IP address or hostname")
     p.add_argument("-p", "--port", type=int, default=500,
                    help="UDP port (default: 500)")
+    p.add_argument("--version", type=int, default=2, choices=[1, 2],
+                   help="IKE version: 1 or 2 (default: 2)")
 
-    alg = p.add_argument_group("algorithm selection")
+    # ── Shared algorithm options ──────────────────────────────────────────
+    alg = p.add_argument_group("algorithm selection (IKEv1 + IKEv2)")
     alg.add_argument("--encr", default="aes-cbc-256",
-                     choices=sorted(ENCR_ALGORITHMS),
                      metavar="ALG",
-                     help=f"Encryption algorithm (default: aes-cbc-256). "
-                          f"Choices: {', '.join(sorted(ENCR_ALGORITHMS))}")
-    alg.add_argument("--integ", default="hmac-sha256-128",
-                     choices=sorted(INTEG_ALGORITHMS),
-                     metavar="ALG",
-                     help=f"Integrity algorithm (default: hmac-sha256-128, ignored for AEAD). "
-                          f"Choices: {', '.join(sorted(INTEG_ALGORITHMS))}")
-    alg.add_argument("--prf", default="hmac-sha256",
-                     choices=sorted(PRF_ALGORITHMS),
-                     metavar="ALG",
-                     help=f"PRF algorithm (default: hmac-sha256). "
-                          f"Choices: {', '.join(sorted(PRF_ALGORITHMS))}")
+                     help=(f"Encryption algorithm (default: aes-cbc-256). "
+                           f"IKEv2: {', '.join(sorted(ENCR_ALGORITHMS))}. "
+                           f"IKEv1: {', '.join(sorted(V1_ENCR_ALGORITHMS))}"))
     alg.add_argument("--dh-group", type=int, default=14,
-                     choices=sorted(DH_GROUPS),
-                     metavar="N",
-                     help=f"DH group number (default: 14). "
-                          f"Choices: {', '.join(str(g) for g in sorted(DH_GROUPS))}")
+                     choices=sorted(DH_GROUPS), metavar="N",
+                     help=f"DH group (default: 14). Choices: {', '.join(str(g) for g in sorted(DH_GROUPS))}")
 
+    # ── IKEv2-specific ────────────────────────────────────────────────────
+    v2 = p.add_argument_group("IKEv2-specific options (ignored when --version 1)")
+    v2.add_argument("--integ", default="hmac-sha256-128",
+                    choices=sorted(INTEG_ALGORITHMS), metavar="ALG",
+                    help=f"Integrity algorithm (default: hmac-sha256-128). "
+                         f"Choices: {', '.join(sorted(INTEG_ALGORITHMS))}")
+    v2.add_argument("--prf", default="hmac-sha256",
+                    choices=sorted(PRF_ALGORITHMS), metavar="ALG",
+                    help=f"PRF algorithm (default: hmac-sha256). "
+                         f"Choices: {', '.join(sorted(PRF_ALGORITHMS))}")
+
+    # ── IKEv1-specific ────────────────────────────────────────────────────
+    v1 = p.add_argument_group("IKEv1-specific options (ignored when --version 2)")
+    v1.add_argument("--hash", default="sha1", dest="hash_alg",
+                    choices=sorted(V1_HASH_ALGORITHMS), metavar="ALG",
+                    help=f"Hash / PRF algorithm (default: sha1). "
+                         f"Choices: {', '.join(sorted(V1_HASH_ALGORITHMS))}")
+    v1.add_argument("--mode", default="main",
+                    choices=["main", "aggressive"],
+                    help="Phase 1 exchange mode (default: main)")
+    v1.add_argument("--lifetime", type=int, default=28800,
+                    help="SA lifetime in seconds (default: 28800)")
+
+    # ── Shared auth / network ─────────────────────────────────────────────
     auth = p.add_argument_group("authentication")
     auth.add_argument("--psk", default="secret",
                       help="Pre-shared key (default: secret)")
@@ -1648,7 +2420,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Show hex dumps of all packets and crypto operations")
-
     p.add_argument("--self-test", action="store_true",
                    help="Run built-in crypto self-tests and exit")
 
@@ -1666,26 +2437,46 @@ def main() -> None:
         parser.error("host is required unless --self-test is given")
 
     try:
-        cfg = IKEConfig(
-            host      = args.host,
-            port      = args.port,
-            encr      = args.encr,
-            integ     = args.integ,
-            prf       = args.prf,
-            dh_group  = args.dh_group,
-            psk       = args.psk,
-            id_local  = args.id_local,
-            id_remote = args.id_remote,
-            timeout   = args.timeout,
-            verbose   = args.verbose,
-        )
+        if args.version == 1:
+            cfg = IKEv1Config(
+                host      = args.host,
+                port      = args.port,
+                encr      = args.encr,
+                hash_alg  = args.hash_alg,
+                dh_group  = args.dh_group,
+                psk       = args.psk,
+                id_local  = args.id_local,
+                id_remote = args.id_remote,
+                mode      = args.mode,
+                lifetime  = args.lifetime,
+                timeout   = args.timeout,
+                verbose   = args.verbose,
+            )
+            client: IKEv1Client | IKEv2Client = IKEv1Client(cfg)
+        else:
+            cfg = IKEConfig(
+                host      = args.host,
+                port      = args.port,
+                encr      = args.encr,
+                integ     = args.integ,
+                prf       = args.prf,
+                dh_group  = args.dh_group,
+                psk       = args.psk,
+                id_local  = args.id_local,
+                id_remote = args.id_remote,
+                timeout   = args.timeout,
+                verbose   = args.verbose,
+            )
+            client = IKEv2Client(cfg)
     except ValueError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    client = IKEv2Client(cfg)
     try:
         client.run()
+    except TimeoutError as e:
+        print(f"\nTimeout: {e}", file=sys.stderr)
+        sys.exit(1)
     except NotImplementedError as e:
         print(f"\n[SCAFFOLD] Not yet implemented: {e}", file=sys.stderr)
         sys.exit(2)
