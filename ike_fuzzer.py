@@ -758,7 +758,7 @@ def run_fuzzer(
             "rounds":    rounds,
             "seed":      seed,
             "summary":   dict(total=total, **tally,
-                              interesting=len(interesting)),
+                              interesting_findings=len(interesting)),
             "findings":  [r.to_dict() for r in interesting],
             "all":       [r.to_dict() for r in results],
         }
