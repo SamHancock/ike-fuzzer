@@ -1609,6 +1609,9 @@ class IKEv1Client:
         self.encr_key: bytes = b""
         self.phase1_iv: bytes = b""
 
+        # Persistent UDP socket — reused for all messages so source port stays fixed
+        self._sock: socket.socket | None = None
+
     # ── Entry point ────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -1623,10 +1626,16 @@ class IKEv1Client:
         self.nonce_i = os.urandom(16)
         self.log.info(f"Nonce I   : {self.nonce_i.hex()}")
 
-        if self.cfg.mode == "main":
-            self._main_mode()
-        else:
-            self._aggressive_mode()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.settimeout(self.cfg.timeout)
+        try:
+            if self.cfg.mode == "main":
+                self._main_mode()
+            else:
+                self._aggressive_mode()
+        finally:
+            self._sock.close()
+            self._sock = None
 
         self.log.section("IKEv1 Phase 1 Complete")
         self.log.info("ISAKMP SA established")
@@ -1851,9 +1860,10 @@ class IKEv1Client:
         attrs += _tv(V1_ATTR_LIFE_TYPE, 1)                          # seconds
         attrs += _tlv(V1_ATTR_LIFE_DUR, struct.pack("!I", self.cfg.lifetime))
 
-        # Transform substructure
-        xform_body = struct.pack("!BBHH", 1, V1_XFORM_KEY_IKE, 0, 0) + attrs
-        xform = struct.pack("!BBH", 0, 0, 8 + len(xform_body)) + xform_body
+        # Transform substructure (RFC 2408 §3.5):
+        #   next(1) res(1) length(2) transform_num(1) transform_id(1) reserved(2) attrs
+        xform_body = struct.pack("!BBH", 1, V1_XFORM_KEY_IKE, 0) + attrs
+        xform = struct.pack("!BBH", 0, 0, 4 + len(xform_body)) + xform_body
 
         # Proposal substructure: last=0, reserved, len, num=1, proto=ISAKMP, spi_size=0, n_xforms=1
         prop_body = struct.pack("!BBBB", 1, V1_PROTO_ISAKMP, 0, 1) + xform
@@ -2114,13 +2124,15 @@ class IKEv1Client:
     def _compute_hash_i(self) -> bytes:
         """
         HASH_I = prf(SKEYID, g^xi | g^xr | CKY-I | CKY-R | SAi_b | IDii_b)
-        g^xi = dh_pub (initiator), g^xr = peer_dh_pub (responder).
-        SAi_b / IDii_b include their generic payload headers.
+
+        SAi_b / IDii_b are the payload BODIES (after the 4-byte generic header).
+        RFC 2409 §5.1 — confirmed empirically against strongSwan: the DOI field
+        is the first byte of SAi_b, not the generic next-payload byte.
         """
         data = (self.dh_pub + self.peer_dh_pub
                 + self.cookie_i + self.cookie_r
-                + self.sa_payload_bytes
-                + self.idi_payload_bytes)
+                + self.sa_payload_bytes[4:]    # body only: DOI | Situation | Proposal…
+                + self.idi_payload_bytes[4:])  # body only: ID_type | reserved | ID_data
         h = self._prf_v1(self.skeyid, data)
         self.log.debug(f"HASH_I = {h.hex()}")
         return h
@@ -2131,8 +2143,8 @@ class IKEv1Client:
         """
         data = (self.peer_dh_pub + self.dh_pub
                 + self.cookie_r + self.cookie_i
-                + self.sa_payload_bytes
-                + self.idr_payload_bytes)
+                + self.sa_payload_bytes[4:]    # body only
+                + self.idr_payload_bytes[4:])  # body only
         h = self._prf_v1(self.skeyid, data)
         self.log.debug(f"HASH_R (expected) = {h.hex()}")
         return h
@@ -2151,32 +2163,24 @@ class IKEv1Client:
     # ── Network I/O ────────────────────────────────────────────────────────
 
     def _send_recv_v1(self, pkt: bytes) -> bytes:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(self.cfg.timeout)
+        dest = (self.cfg.host, self.cfg.port)
+        self.log.debug(f"UDP → {dest[0]}:{dest[1]}  ({len(pkt)}B)")
+        self._sock.sendto(pkt, dest)
         try:
-            dest = (self.cfg.host, self.cfg.port)
-            self.log.debug(f"UDP → {dest[0]}:{dest[1]}  ({len(pkt)}B)")
-            sock.sendto(pkt, dest)
-            data, addr = sock.recvfrom(65535)
-            self.log.debug(f"UDP ← {addr[0]}:{addr[1]}  ({len(data)}B)")
-            self.log.debug("Raw response:", data)
-            return data
+            data, addr = self._sock.recvfrom(65535)
         except socket.timeout:
             raise TimeoutError(
                 f"No IKEv1 response from {self.cfg.host}:{self.cfg.port} "
                 f"within {self.cfg.timeout}s"
             ) from None
-        finally:
-            sock.close()
+        self.log.debug(f"UDP ← {addr[0]}:{addr[1]}  ({len(data)}B)")
+        self.log.debug("Raw response:", data)
+        return data
 
     def _send_no_wait_v1(self, pkt: bytes) -> None:
         """Fire-and-forget UDP send (used for Aggressive Mode message 3)."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self.log.debug(f"UDP → {self.cfg.host}:{self.cfg.port}  ({len(pkt)}B) [no-wait]")
-            sock.sendto(pkt, (self.cfg.host, self.cfg.port))
-        finally:
-            sock.close()
+        self.log.debug(f"UDP → {self.cfg.host}:{self.cfg.port}  ({len(pkt)}B) [no-wait]")
+        self._sock.sendto(pkt, (self.cfg.host, self.cfg.port))
 
 
 # ---------------------------------------------------------------------------
