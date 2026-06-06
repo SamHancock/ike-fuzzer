@@ -350,6 +350,69 @@ def gen_sa_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
                               _craft_proposal(PROTO_IKE, xf_norm2), critical=True)),
                           "any"))
 
+    # 9. Missing PRF transform (RFC 7296 §3.3.2 mandates PRF in IKE_SA_INIT)
+    kl = _key_len_attr(encr.key_len) if encr.transform_id != 3 else b""
+    xf_no_prf = [_craft_transform(TRANSFORM_TYPE_ENCR, encr.transform_id, kl)]
+    if integ:
+        xf_no_prf.append(_craft_transform(TRANSFORM_TYPE_INTEG, integ.transform_id))
+    xf_no_prf.append(_craft_transform(TRANSFORM_TYPE_DH, dh, last=True))
+    cases.append(FuzzCase(0, "sa-missing-prf", "sa",
+                          "SA proposal omits mandatory PRF transform",
+                          _replace_sa(_craft_sa_payload(PAYLOAD_KE,
+                              _craft_proposal(PROTO_IKE, xf_no_prf))),
+                          "rejected"))
+
+    # 10. Missing DH transform (KE payload present but no agreed group)
+    kl = _key_len_attr(encr.key_len) if encr.transform_id != 3 else b""
+    xf_no_dh = [_craft_transform(TRANSFORM_TYPE_ENCR, encr.transform_id, kl),
+                _craft_transform(TRANSFORM_TYPE_PRF, prf.transform_id)]
+    if integ:
+        xf_no_dh.append(_craft_transform(TRANSFORM_TYPE_INTEG, integ.transform_id, last=True))
+    else:
+        xf_no_dh[-1] = _craft_transform(TRANSFORM_TYPE_PRF, prf.transform_id, last=True)
+    cases.append(FuzzCase(0, "sa-missing-dh", "sa",
+                          "SA proposal omits DH transform (KE payload still present)",
+                          _replace_sa(_craft_sa_payload(PAYLOAD_KE,
+                              _craft_proposal(PROTO_IKE, xf_no_dh))),
+                          "rejected"))
+
+    # 11. Two proposals: valid first + second with unrecognised DH group 999
+    prop1      = _craft_proposal(PROTO_IKE, _normal_xforms())
+    prop1_more = _set_u8(prop1, 0, 2)          # byte 0 = last/more; 2 = more proposals follow
+    prop2      = _craft_proposal(PROTO_IKE, _normal_xforms(override_dh=999))
+    prop2_n2   = _set_u8(prop2, 4, 2)          # proposal number field = 2
+    cases.append(FuzzCase(0, "sa-two-proposals", "sa",
+                          "SA two proposals: valid first, DH-999 second",
+                          _replace_sa(_craft_sa_payload(PAYLOAD_KE,
+                              prop1_more + prop2_n2)),
+                          "any"))
+
+    # 12. ENCR key length attribute = 0
+    kl_zero = struct.pack("!HH", 0x800E, 0)
+    xf_kl0 = [_craft_transform(TRANSFORM_TYPE_ENCR, encr.transform_id, kl_zero),
+               _craft_transform(TRANSFORM_TYPE_PRF, prf.transform_id)]
+    if integ:
+        xf_kl0.append(_craft_transform(TRANSFORM_TYPE_INTEG, integ.transform_id))
+    xf_kl0.append(_craft_transform(TRANSFORM_TYPE_DH, dh, last=True))
+    cases.append(FuzzCase(0, "sa-key-len-zero", "sa",
+                          "SA ENCR transform key length attribute = 0 bits",
+                          _replace_sa(_craft_sa_payload(PAYLOAD_KE,
+                              _craft_proposal(PROTO_IKE, xf_kl0))),
+                          "rejected"))
+
+    # 13. ENCR key length attribute = 65535
+    kl_huge = struct.pack("!HH", 0x800E, 65535)
+    xf_klhuge = [_craft_transform(TRANSFORM_TYPE_ENCR, encr.transform_id, kl_huge),
+                 _craft_transform(TRANSFORM_TYPE_PRF, prf.transform_id)]
+    if integ:
+        xf_klhuge.append(_craft_transform(TRANSFORM_TYPE_INTEG, integ.transform_id))
+    xf_klhuge.append(_craft_transform(TRANSFORM_TYPE_DH, dh, last=True))
+    cases.append(FuzzCase(0, "sa-key-len-huge", "sa",
+                          "SA ENCR transform key length attribute = 65535 bits",
+                          _replace_sa(_craft_sa_payload(PAYLOAD_KE,
+                              _craft_proposal(PROTO_IKE, xf_klhuge))),
+                          "rejected"))
+
     return cases
 
 
@@ -382,6 +445,10 @@ def gen_ke_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
          _craft_ke_payload(PAYLOAD_NONCE, dh, b""), "rejected"),
         ("ke-pubkey-one-byte","KE public key = single 0x01 byte",
          _craft_ke_payload(PAYLOAD_NONCE, dh, b"\x01"), "rejected"),
+        ("ke-pubkey-half",    "KE public key = half expected length",
+         _craft_ke_payload(PAYLOAD_NONCE, dh, os.urandom(pubkey_len // 2)), "rejected"),
+        ("ke-pubkey-short-1", "KE public key one byte shorter than expected",
+         _craft_ke_payload(PAYLOAD_NONCE, dh, os.urandom(pubkey_len - 1)), "rejected"),
     ]
     for name, desc, ke_pld, exp in specs:
         cases.append(FuzzCase(0, name, "ke", desc, _replace_ke(ke_pld), exp))
@@ -411,6 +478,8 @@ def gen_nonce_mutations(base: bytes, cfg: IKEConfig) -> list[FuzzCase]:
          _craft_nonce_payload(PAYLOAD_NONE, bytes(32)), "any"),
         ("nonce-huge",    "Nonce = 2048 bytes",
          _craft_nonce_payload(PAYLOAD_NONE, os.urandom(2048)), "any"),
+        ("nonce-all-ff",  "Nonce = 32 bytes of 0xFF",
+         _craft_nonce_payload(PAYLOAD_NONE, bytes([0xFF] * 32)), "any"),
     ]
     for name, desc, ni_pld, exp in specs:
         cases.append(FuzzCase(0, name, "nonce", desc, _replace_nonce(ni_pld), exp))
@@ -423,6 +492,7 @@ def gen_payload_chain_mutations(base: bytes) -> list[FuzzCase]:
     sa_len = struct.unpack("!H", base[30:32])[0]
     ke_off = 28 + sa_len
     ke_len = struct.unpack("!H", base[ke_off+2:ke_off+4])[0]
+    ni_off = ke_off + ke_len
 
     # 1. IKE header next_payload → unknown type
     cases.append(FuzzCase(0, "chain-nxt-unknown", "payload",
@@ -464,6 +534,70 @@ def gen_payload_chain_mutations(base: bytes) -> list[FuzzCase]:
     cases.append(FuzzCase(0, "sa-length-ffff", "payload",
                           "SA payload length field = 0xFFFF",
                           _set_u16be(base, 30, 0xFFFF), "timeout"))
+
+    # Payload slice helpers
+    sa_bytes = base[28:ke_off]          # SA payload (next_payload = KE)
+    ke_bytes = base[ke_off:ni_off]      # KE payload (next_payload = Nonce)
+    ni_bytes = base[ni_off:]            # Nonce payload (next_payload = None)
+
+    def _rebuild(body: bytes) -> bytes:
+        """Assemble a new IKE packet from a raw payload block, fixing total length."""
+        return _set_u32be(base[:28], 24, 28 + len(body)) + body
+
+    # 7. SA missing — IKE header next_payload jumps straight to KE
+    new_hdr = _set_u8(base[:28], 16, PAYLOAD_KE)
+    ke_ni   = base[ke_off:]
+    cases.append(FuzzCase(0, "chain-sa-missing", "payload",
+                          "SA payload omitted; chain starts at KE",
+                          _set_u32be(new_hdr, 24, 28 + len(ke_ni)) + ke_ni,
+                          "rejected"))
+
+    # 8. KE missing — SA next_payload points directly to Nonce
+    sa_skip_ke = _set_u8(sa_bytes, 0, PAYLOAD_NONCE)
+    cases.append(FuzzCase(0, "chain-ke-missing", "payload",
+                          "KE payload omitted; SA next_payload = Nonce",
+                          _rebuild(sa_skip_ke + ni_bytes),
+                          "rejected"))
+
+    # 9. Nonce missing — KE next_payload = None, packet ends after KE
+    ke_no_ni = _set_u8(ke_bytes, 0, PAYLOAD_NONE)
+    cases.append(FuzzCase(0, "chain-nonce-missing", "payload",
+                          "Nonce payload omitted; KE next_payload = None",
+                          _rebuild(sa_bytes + ke_no_ni),
+                          "rejected"))
+
+    # 10. Duplicate SA — two identical SA payloads before KE
+    sa_1 = _set_u8(sa_bytes, 0, PAYLOAD_SA)    # first SA → second SA
+    sa_2 = sa_bytes                             # second SA → KE (unchanged)
+    cases.append(FuzzCase(0, "chain-dup-sa", "payload",
+                          "Two identical SA payloads in chain",
+                          _rebuild(sa_1 + sa_2 + ke_bytes + ni_bytes),
+                          "any"))
+
+    # 11. Duplicate KE — two identical KE payloads
+    ke_1 = _set_u8(ke_bytes, 0, PAYLOAD_KE)    # first KE → second KE
+    ke_2 = ke_bytes                             # second KE → Nonce (unchanged)
+    cases.append(FuzzCase(0, "chain-dup-ke", "payload",
+                          "Two identical KE payloads in chain",
+                          _rebuild(sa_bytes + ke_1 + ke_2 + ni_bytes),
+                          "any"))
+
+    # 12. Duplicate Nonce — two identical Nonce payloads
+    ni_1 = _set_u8(ni_bytes, 0, PAYLOAD_NONCE)  # first Nonce → second Nonce
+    ni_2 = _set_u8(ni_bytes, 0, PAYLOAD_NONE)   # second Nonce → None
+    cases.append(FuzzCase(0, "chain-dup-nonce", "payload",
+                          "Two identical Nonce payloads in chain",
+                          _rebuild(sa_bytes + ke_bytes + ni_1 + ni_2),
+                          "any"))
+
+    # 13. Payload order swapped — SA, Nonce, KE (Nonce before KE)
+    sa_to_ni  = _set_u8(sa_bytes,  0, PAYLOAD_NONCE)  # SA → Nonce
+    ni_to_ke  = _set_u8(ni_bytes,  0, PAYLOAD_KE)     # Nonce → KE
+    ke_to_end = _set_u8(ke_bytes,  0, PAYLOAD_NONE)   # KE → None
+    cases.append(FuzzCase(0, "chain-order-sa-ni-ke", "payload",
+                          "Payload order: SA, Nonce, KE (non-standard ordering)",
+                          _rebuild(sa_to_ni + ni_to_ke + ke_to_end),
+                          "any"))
 
     return cases
 
@@ -842,6 +976,10 @@ def run_fuzzer(
             f"{case.name:<30}  {r.verdict.upper():<14}  {r.notes}"
         )
         print(_cprint(line, r.verdict))
+        if case.category == "random" and case.mutations:
+            for m in case.mutations:
+                print(f"              [{m['offset']:3d} {m['field']}]"
+                      f"  {m['original']} → {m['modified']}")
 
         if delay > 0:
             time.sleep(delay)
