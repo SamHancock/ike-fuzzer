@@ -34,7 +34,7 @@ except ImportError:
     _TripleDES = cipher_algorithms.TripleDES   # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
-# IKEv2 constants (mirrors scapy.contrib.ikev2 numeric values)
+# IKEv2 constants (RFC 7296 numeric values)
 # ---------------------------------------------------------------------------
 
 EXCHANGE_IKE_SA_INIT = 34

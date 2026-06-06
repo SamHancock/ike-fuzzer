@@ -547,5 +547,4 @@ timed out.
 
 ## Dependencies
 
-- [scapy](https://scapy.net/) ≥ 2.7 — IKEv2 packet constants and field definitions
 - [cryptography](https://cryptography.io/) ≥ 43 — DH/ECDH, AES-CBC, AES-GCM, HMAC
