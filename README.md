@@ -278,6 +278,9 @@ venv/bin/python ike_client.py <host> --version 1 [options]
 --dh-group N              DH group (default: 14)
 --psk PSK                 Pre-shared key
 --lifetime N              SA lifetime in seconds (default: 28800)
+--capture-file FILE       Aggressive Mode only: save HASH_R and all crack
+                          material to FILE (JSON) and FILE.hc (hashcat line).
+                          Not written unless this option is given.
 ```
 
 **Hash algorithms (`--hash`)**
@@ -326,6 +329,64 @@ venv/bin/python ike_client.py 127.0.0.1 --version 1 \
     --dh-group 14 \
     --psk secret
 ```
+
+Aggressive Mode with PSK crack-material capture:
+```bash
+venv/bin/python ike_client.py 127.0.0.1 --version 1 \
+    --mode aggressive \
+    --hash sha1 \
+    --dh-group 14 \
+    --psk secret \
+    --capture-file capture.json
+```
+
+### Offline PSK cracking (`--capture-file`)
+
+In IKEv1 Aggressive Mode the responder's HASH_R is transmitted in the
+clear, exposing the PSK to offline dictionary attack. `--capture-file FILE`
+saves all the material needed to crack it — it is **not** written by
+default and only applies to `--mode aggressive`.
+
+Two files are written:
+
+| File | Contents |
+|------|----------|
+| `FILE` | JSON — all nine fields plus cracking formula and hashcat metadata |
+| `FILE.hc` | Bare hashcat-compatible colon-separated line |
+
+**Cracking formula (RFC 2409 §5.1):**
+```
+SKEYID  = HMAC(PSK,     Ni || Nr)
+HASH_R  = HMAC(SKEYID,  g_xr || g_xi || CKY-R || CKY-I || SAi_b || IDir_b)
+```
+A candidate PSK is correct when HASH_R computed from it equals the
+captured `hash_r` value.
+
+**JSON fields:**
+
+| Field | Description |
+|-------|-------------|
+| `cky_i` | Initiator cookie (8 bytes) |
+| `cky_r` | Responder cookie (8 bytes) |
+| `nonce_i` | Initiator nonce Ni |
+| `nonce_r` | Responder nonce Nr |
+| `g_xi` | Initiator DH public key |
+| `g_xr` | Responder DH public key |
+| `sai_b` | SA payload body from message 1 (without generic header) |
+| `idir_b` | Responder ID payload body from message 2 (without generic header) |
+| `hash_r` | HASH_R received from responder — the value to crack against |
+
+**Hashcat usage:**
+
+| Hash algorithm | hashcat mode | Command |
+|----------------|-------------|---------|
+| SHA-1 | 5400 | `hashcat -m 5400 capture.json.hc wordlist.txt` |
+| MD5 | 5300 | `hashcat -m 5300 capture.json.hc wordlist.txt` |
+| SHA-256 / SHA-512 | — | No built-in hashcat mode; use john `--format=IKE` or a custom script with the JSON fields |
+
+> **Note:** `sai_b` and `idir_b` are stored in the JSON and are required
+> to recompute HASH_R, but are not included in the standard hashcat `.hc`
+> line format. Custom cracking scripts should read them from the JSON.
 
 ### IKEv1 Phase 1 exchange flow
 
