@@ -53,6 +53,7 @@ class FuzzCase:
     description: str
     pkt:         bytes
     expected:    str           # "timeout" | "rejected" | "accepted" | "any"
+    mutations:   list          = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -77,6 +78,7 @@ class FuzzResult:
             "category":    self.case.category,
             "description": self.case.description,
             "pkt_len":     len(self.case.pkt),
+            "mutations":   self.case.mutations,
             "expected":    self.case.expected,
             "verdict":     self.verdict,
             "notify_type": self.notify_type,
@@ -479,20 +481,138 @@ def gen_truncation_cases(base: bytes) -> list[FuzzCase]:
     return cases
 
 
+def _label_sa_body(pkt: bytes, start: int, end: int, labels: dict[int, str]) -> None:
+    """Fill `labels` with field descriptions for bytes inside an SA payload body."""
+    XFORM_TYPE_NAMES = {1: "ENCR", 2: "PRF", 3: "INTEG", 4: "DH", 5: "ESN"}
+    off      = start
+    prop_num = 1
+    while off + 8 <= end:
+        prop_len = struct.unpack("!H", pkt[off + 2:off + 4])[0]
+        if prop_len < 8 or off + prop_len > end:
+            break
+        p = f"SA-prop{prop_num}"
+        labels[off]     = f"{p} last/more"
+        labels[off + 1] = f"{p} reserved"
+        labels[off + 2] = f"{p} length[0]"
+        labels[off + 3] = f"{p} length[1]"
+        labels[off + 4] = f"{p} number"
+        labels[off + 5] = f"{p} protocol-id"
+        labels[off + 6] = f"{p} spi-size"
+        labels[off + 7] = f"{p} num-transforms"
+        spi_size   = pkt[off + 6]
+        num_xforms = pkt[off + 7]
+        xf_off = off + 8 + spi_size
+        for xi in range(num_xforms):
+            if xf_off + 8 > off + prop_len:
+                break
+            xf_len = struct.unpack("!H", pkt[xf_off + 2:xf_off + 4])[0]
+            if xf_len < 8:
+                break
+            tname = XFORM_TYPE_NAMES.get(pkt[xf_off + 4], f"type{pkt[xf_off + 4]}")
+            x = f"SA-xform{xi + 1}({tname})"
+            labels[xf_off]     = f"{x} last/more"
+            labels[xf_off + 1] = f"{x} reserved"
+            labels[xf_off + 2] = f"{x} length[0]"
+            labels[xf_off + 3] = f"{x} length[1]"
+            labels[xf_off + 4] = f"{x} type"
+            labels[xf_off + 5] = f"{x} reserved"
+            labels[xf_off + 6] = f"{x} id[0]"
+            labels[xf_off + 7] = f"{x} id[1]"
+            for ai in range(xf_off + 8, xf_off + xf_len):
+                labels[ai] = f"{x} attr[{ai - xf_off - 8}]"
+            xf_off += xf_len
+        off += prop_len
+        prop_num += 1
+
+
+def _label_offsets(pkt: bytes) -> dict[int, str]:
+    """
+    Return a mapping of byte offset → human-readable field name for an IKE_SA_INIT packet.
+
+    Walks the IKE fixed header and each payload in the chain, assigning a semantic
+    label (e.g. 'IKE-hdr exchange-type', 'KE pubkey[3]', 'SA-xform1(ENCR) id[0]')
+    to every byte.  Used by gen_random_mutations to annotate flipped bytes.
+    """
+    labels: dict[int, str] = {}
+    if len(pkt) < 28:
+        return labels
+
+    for i in range(8): labels[i]      = f"IKE-hdr SPIi[{i}]"
+    for i in range(8): labels[8 + i]  = f"IKE-hdr SPIr[{i}]"
+    labels[16] = "IKE-hdr next-payload"
+    labels[17] = "IKE-hdr version"
+    labels[18] = "IKE-hdr exchange-type"
+    labels[19] = "IKE-hdr flags"
+    for i in range(4): labels[20 + i] = f"IKE-hdr msg-id[{i}]"
+    for i in range(4): labels[24 + i] = f"IKE-hdr total-len[{i}]"
+
+    cur_type = pkt[16]
+    off = 28
+    while cur_type != 0 and off + 4 <= len(pkt):
+        next_type = pkt[off]
+        plen = struct.unpack("!H", pkt[off + 2:off + 4])[0]
+        if plen < 4 or off + plen > len(pkt):
+            break
+        pname = PAYLOAD_NAMES.get(cur_type, f"payload{cur_type}")
+        labels[off]     = f"{pname} next-payload"
+        labels[off + 1] = f"{pname} critical/flags"
+        labels[off + 2] = f"{pname} length[0]"
+        labels[off + 3] = f"{pname} length[1]"
+        body_start = off + 4
+        body_end   = off + plen
+        if cur_type == PAYLOAD_SA:       # 33
+            _label_sa_body(pkt, body_start, body_end, labels)
+        elif cur_type == PAYLOAD_KE:     # 34
+            if body_start + 4 <= body_end:
+                labels[body_start]     = "KE DH-group[0]"
+                labels[body_start + 1] = "KE DH-group[1]"
+                labels[body_start + 2] = "KE reserved[0]"
+                labels[body_start + 3] = "KE reserved[1]"
+                for i in range(body_start + 4, body_end):
+                    labels[i] = f"KE pubkey[{i - body_start - 4}]"
+        elif cur_type == PAYLOAD_NONCE:  # 40
+            for i in range(body_start, body_end):
+                labels[i] = f"Nonce data[{i - body_start}]"
+        cur_type = next_type
+        off += plen
+    return labels
+
+
 def gen_random_mutations(base: bytes, n: int, seed: int) -> list[FuzzCase]:
-    """Flip 1–4 bytes at random offsets using a fixed seed for reproducibility."""
-    rng   = random.Random(seed)
+    """
+    Flip 1–4 bytes at random offsets using a fixed seed for reproducibility.
+
+    Each FuzzCase.mutations list contains one dict per flipped byte with keys:
+      offset    — byte position in the packet
+      field     — human-readable field name (e.g. 'IKE-hdr exchange-type')
+      original  — hex value before mutation (e.g. '0x22')
+      modified  — hex value after mutation  (e.g. '0x7f')
+    """
+    labels = _label_offsets(base)
+    rng    = random.Random(seed)
     cases: list[FuzzCase] = []
     for i in range(n):
         pkt     = bytearray(base)
         count   = rng.randint(1, 4)
         offsets = [rng.randint(0, len(base) - 1) for _ in range(count)]
-        for off in offsets:
-            pkt[off] = rng.randint(0, 255)
+        orig_vals = [pkt[off] for off in offsets]          # capture before mutation
+        new_vals  = [rng.randint(0, 255) for _ in offsets] # same RNG call sequence as before
+        for off, new_val in zip(offsets, new_vals):
+            pkt[off] = new_val
+        mutations = [
+            {
+                "offset":   off,
+                "field":    labels.get(off, f"byte[{off}]"),
+                "original": f"0x{orig:02x}",
+                "modified": f"0x{new:02x}",
+            }
+            for off, orig, new in zip(offsets, orig_vals, new_vals)
+        ]
         desc = "Random flip: " + ", ".join(
-            f"[{o}]=0x{pkt[o]:02x}" for o in offsets
+            f"[{m['offset']} {m['field']}] {m['original']}→{m['modified']}"
+            for m in mutations
         )
-        cases.append(FuzzCase(0, f"random-{i:03d}", "random", desc, bytes(pkt), "any"))
+        cases.append(FuzzCase(0, f"random-{i:03d}", "random", desc, bytes(pkt), "any", mutations))
     return cases
 
 
