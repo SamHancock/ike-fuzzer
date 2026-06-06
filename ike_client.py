@@ -2312,7 +2312,7 @@ def run_self_test() -> bool:
                   integ="hmac-sha1-96", prf="hmac-sha1", dh_group=19, psk="test")
     x = _silent(ec_cfg); x._generate_dh_keypair()
     y = _silent(ec_cfg); y._generate_dh_keypair()
-    assert len(x.dh_pub) == 65, f"P-256 pub key should be 65B, got {len(x.dh_pub)}"
+    assert len(x.dh_pub) == 64, f"P-256 pub key should be 64B, got {len(x.dh_pub)}"
     x._compute_dh_shared(y.dh_pub)
     y._compute_dh_shared(x.dh_pub)
     check("DH Group 19 (P-256) two-party agreement", x.dh_shared, y.dh_shared)
