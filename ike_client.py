@@ -2571,6 +2571,9 @@ def main() -> None:
     if not args.host:
         parser.error("host is required unless --self-test is given")
 
+    if args.capture_file and (args.version != 1 or args.mode != "aggressive"):
+        parser.error("--capture-file requires --version 1 --mode aggressive")
+
     try:
         if args.version == 1:
             cfg = IKEv1Config(
@@ -2588,8 +2591,6 @@ def main() -> None:
                 verbose      = args.verbose,
                 capture_file = args.capture_file,
             )
-            if args.capture_file and args.mode != "aggressive":
-                parser.error("--capture-file is only meaningful with --mode aggressive")
             client: IKEv1Client | IKEv2Client = IKEv1Client(cfg)
         else:
             cfg = IKEConfig(
