@@ -523,8 +523,11 @@ def classify(resp: bytes, spi_i: bytes) -> tuple[str, Optional[int], str]:
 
     verdict:
       accepted    — SA_INIT response with assigned SPIr and no error notifies
-      rejected    — SA_INIT response containing at least one error Notify (type < 16384)
-      interesting — valid IKE framing but unexpected content
+      rejected    — error Notify (type < 16384) present, OR SPIr=0 with only
+                    informational notifies (type ≥ 16384, responder declined
+                    without allocating an SPI)
+      interesting — valid IKE framing but genuinely ambiguous (e.g. SPIr=0
+                    with no notifies at all, wrong exchange type, SPIi mismatch)
       malformed   — fewer than 28 bytes; can't parse IKE header
       (timeout is handled by the caller returning None response)
     """
@@ -577,9 +580,13 @@ def classify(resp: bytes, spi_i: bytes) -> tuple[str, Optional[int], str]:
             # No error, non-zero SPIr → SA offered / accepted
             return "accepted", notify_types[0] if notify_types else None, \
                    " | ".join(notes_parts) or "SA_INIT accepted"
+        elif notify_types:
+            # SPIr=0, no error notifies, but informational notifies present —
+            # the responder declined without assigning an SPI.
+            return "rejected", None, " | ".join(notes_parts)
         else:
-            # No error notify AND SPIr still zero — unusual
-            notes_parts.append("SPIr=0 with no error notify")
+            # SPIr=0, no notifies at all — genuinely ambiguous.
+            notes_parts.append("SPIr=0 with no notifies")
             return "interesting", None, " | ".join(notes_parts)
 
     if r_exch == EXCHANGE_IKE_SA_INIT and not is_resp:
