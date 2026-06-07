@@ -278,9 +278,12 @@ venv/bin/python ike_client.py <host> --version 1 [options]
 --dh-group N              DH group (default: 14)
 --psk PSK                 Pre-shared key
 --lifetime N              SA lifetime in seconds (default: 28800)
---capture-file FILE       Aggressive Mode only: save HASH_R and all crack
-                          material to FILE (JSON) and FILE.hc (hashcat line).
+--capture-file FILE       Aggressive Mode only: save crack material to FILE
+                          (JSON) and FILE.hc (hashcat line, MODP-1024 only).
                           Not written unless this option is given.
+--psk-crack FILE WORDLIST Offline PSK crack using a --capture-file JSON.
+                          Tests every wordlist line against HASH_I and HASH_R.
+                          Works for any DH group. No host connection needed.
 ```
 
 **Hash algorithms (`--hash`)**
@@ -340,7 +343,7 @@ venv/bin/python ike_client.py 127.0.0.1 --version 1 \
     --capture-file capture.json
 ```
 
-### Offline PSK cracking (`--capture-file`)
+### Offline PSK cracking (`--capture-file` + `--psk-crack`)
 
 In IKEv1 Aggressive Mode the responder's HASH_R is transmitted in the
 clear, exposing the PSK to offline dictionary attack. `--capture-file FILE`
@@ -351,42 +354,77 @@ Two files are written:
 
 | File | Contents |
 |------|----------|
-| `FILE` | JSON — all nine fields plus cracking formula and hashcat metadata |
-| `FILE.hc` | Bare hashcat-compatible colon-separated line |
+| `FILE` | JSON — all fields, both cracking formulae, and tool metadata |
+| `FILE.hc` | hashcat-compatible line (MODP-1024 / group 2 only — see below) |
 
-**Cracking formula (RFC 2409 §5.1):**
+**Cracking formulae (RFC 2409 §5.1):**
 ```
 SKEYID  = HMAC(PSK,     Ni || Nr)
+HASH_I  = HMAC(SKEYID,  g_xi || g_xr || CKY-I || CKY-R || SAi_b || IDii_b)
 HASH_R  = HMAC(SKEYID,  g_xr || g_xi || CKY-R || CKY-I || SAi_b || IDir_b)
 ```
-A candidate PSK is correct when HASH_R computed from it equals the
-captured `hash_r` value.
+Both HASH_I and HASH_R are stored in the JSON. Either can confirm a
+correct PSK candidate.
 
 **JSON fields:**
 
 | Field | Description |
 |-------|-------------|
+| `g_xi` | Initiator DH public key |
+| `g_xr` | Responder DH public key |
 | `cky_i` | Initiator cookie (8 bytes) |
 | `cky_r` | Responder cookie (8 bytes) |
 | `nonce_i` | Initiator nonce Ni |
 | `nonce_r` | Responder nonce Nr |
-| `g_xi` | Initiator DH public key |
-| `g_xr` | Responder DH public key |
 | `sai_b` | SA payload body from message 1 (without generic header) |
+| `idii_b` | Initiator ID payload body from message 1 (without generic header) |
 | `idir_b` | Responder ID payload body from message 2 (without generic header) |
-| `hash_r` | HASH_R received from responder — the value to crack against |
+| `hash_i` | HASH_I computed by the initiator |
+| `hash_r` | HASH_R received from the responder (transmitted in the clear) |
 
-**Hashcat usage:**
+#### Cracking with `--psk-crack` (recommended)
+
+The built-in cracker works for **any DH group** and tests each candidate
+against both HASH_I and HASH_R:
+
+```bash
+venv/bin/python ike_client.py --psk-crack capture.json wordlist.txt
+```
+
+Example output:
+```
+[crack] Target     : 127.0.0.1:500
+[crack] Hash alg   : SHA1
+[crack] HASH_I     : e23ba5fb334921caa8d3b9bf3df9813658d605da
+[crack] HASH_R     : 7ee95c94eed194f2153e70d971276f105aa01fa7
+[crack] Wordlist   : wordlist.txt
+
+[crack] PSK FOUND (HASH_I match): 'secret'
+[crack] Tested 3 candidates in 0.00s
+```
+
+#### Cracking with hashcat (MODP-1024 / group 2 only)
+
+> **hashcat limitation:** hashcat modes 5300 (MD5) and 5400 (SHA1) have
+> hardcoded buffer limits based on MODP-1024 (128-byte DH keys). Captures
+> using DH group 14 (MODP-2048) or larger will fail with a
+> `Salt-length exception`. Use `--psk-crack` instead for those groups.
+
+The `.hc` file is only usable when `--dh-group 2` (MODP-1024) was used.
+The 9-field format (verified against hashcat's built-in example hashes):
+
+```
+g_xi:g_xr:cky_i:cky_r:sai_b:IDii_b:Ni:Nr:HASH_I
+```
 
 | Hash algorithm | hashcat mode | Command |
 |----------------|-------------|---------|
 | SHA-1 | 5400 | `hashcat -m 5400 capture.json.hc wordlist.txt` |
 | MD5 | 5300 | `hashcat -m 5300 capture.json.hc wordlist.txt` |
-| SHA-256 / SHA-512 | — | No built-in hashcat mode; use john `--format=IKE` or a custom script with the JSON fields |
+| SHA-256 / SHA-512 | — | No built-in hashcat mode; use `--psk-crack` |
 
-> **Note:** `sai_b` and `idir_b` are stored in the JSON and are required
-> to recompute HASH_R, but are not included in the standard hashcat `.hc`
-> line format. Custom cracking scripts should read them from the JSON.
+The JSON `hashcat.usage` field will indicate whether the `.hc` file is
+usable for the captured DH group, or instruct you to use `--psk-crack`.
 
 ### IKEv1 Phase 1 exchange flow
 
