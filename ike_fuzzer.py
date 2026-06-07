@@ -36,6 +36,19 @@ from ike_client import (
     PROTO_IKE, PROTO_AH, PROTO_ESP,
     TRANSFORM_TYPE_ENCR, TRANSFORM_TYPE_PRF, TRANSFORM_TYPE_INTEG, TRANSFORM_TYPE_DH,
     NOTIFY_NO_PROPOSAL_CHOSEN, NOTIFY_INVALID_KE_PAYLOAD,
+    # IKEv1
+    IKEv1Client, IKEv1Config,
+    V1_EXCHANGE_MAIN, V1_EXCHANGE_AGGRESSIVE, V1_EXCHANGE_INFO,
+    V1_PAYLOAD_NONE, V1_PAYLOAD_SA, V1_PAYLOAD_KE, V1_PAYLOAD_ID,
+    V1_PAYLOAD_NONCE, V1_PAYLOAD_HASH, V1_PAYLOAD_NOTIFY, V1_PAYLOAD_VID,
+    V1_PAYLOAD_NAMES,
+    V1_ATTR_ENCR, V1_ATTR_HASH, V1_ATTR_AUTH, V1_ATTR_GROUP,
+    V1_ATTR_LIFE_TYPE, V1_ATTR_LIFE_DUR, V1_ATTR_KEY_LEN,
+    V1_ENCR_AES_CBC, V1_ENCR_3DES,
+    V1_HASH_MD5, V1_HASH_SHA1, V1_HASH_SHA256,
+    V1_AUTH_PSK, V1_DOI_IPSEC, V1_SITUATION_ID, V1_PROTO_ISAKMP,
+    V1_XFORM_KEY_IKE, V1_ID_IPV4_ADDR, V1_FLAG_ENCRYPTION,
+    V1_ENCR_ALGORITHMS, V1_HASH_ALGORITHMS,
     _hex_dump,
 )
 
@@ -751,6 +764,855 @@ def gen_random_mutations(base: bytes, n: int, seed: int) -> list[FuzzCase]:
 
 
 # ---------------------------------------------------------------------------
+# IKEv1 low-level helpers
+# ---------------------------------------------------------------------------
+
+def _v1_tv(attr_type: int, val: int) -> bytes:
+    """IKEv1 Type/Value attribute (2-byte type with high bit set, 2-byte value)."""
+    return struct.pack("!HH", 0x8000 | attr_type, val)
+
+
+def _v1_tlv(attr_type: int, data: bytes) -> bytes:
+    """IKEv1 Type/Length/Value attribute."""
+    return struct.pack("!HH", attr_type, len(data)) + data
+
+
+def _v1_transform(xform_num: int, xform_id: int, attrs: bytes,
+                  last: bool = False) -> bytes:
+    """Build an ISAKMP Transform substructure (RFC 2408 §3.5)."""
+    more = 0 if last else 3
+    return struct.pack("!BBH", more, 0, 8 + len(attrs)) \
+         + struct.pack("!BBH", xform_num, xform_id, 0) \
+         + attrs
+
+
+def _v1_proposal(prop_num: int, proto_id: int, xforms: list[bytes],
+                 spi: bytes = b"") -> bytes:
+    """Build an ISAKMP Proposal substructure (RFC 2408 §3.4)."""
+    xf_bytes = b"".join(xforms)
+    body = struct.pack("!BBBB", prop_num, proto_id, len(spi), len(xforms)) \
+         + spi + xf_bytes
+    return struct.pack("!BBH", 0, 0, 4 + len(body)) + body
+
+
+def _craft_v1_sa(next_payload: int, proposals: bytes) -> bytes:
+    """Wrap proposal bytes in an ISAKMP SA payload (DOI + Situation header)."""
+    sa_body = struct.pack("!II", V1_DOI_IPSEC, V1_SITUATION_ID) + proposals
+    return struct.pack("!BBH", next_payload, 0, 4 + len(sa_body)) + sa_body
+
+
+def _craft_v1_id(next_payload: int, id_type: int, id_data: bytes) -> bytes:
+    """Build an ISAKMP Identification payload."""
+    body = struct.pack("!BBBB", id_type, 0, 0, 0) + id_data
+    return struct.pack("!BBH", next_payload, 0, 4 + len(body)) + body
+
+
+# ---------------------------------------------------------------------------
+# IKEv1 base packet builder
+# ---------------------------------------------------------------------------
+
+_V1_FUZZ_ID = "127.0.0.1"  # fixed ID used for all fuzz packets
+
+
+def build_base_packet_v1(cfg: IKEv1Config, mode: str) -> tuple[bytes, IKEv1Client]:
+    """
+    Build a valid IKEv1 Phase 1 Message 1 packet using the normal client machinery.
+
+    Main Mode    → ISAKMP header + SA
+    Aggressive   → ISAKMP header + SA + KE + Nonce + IDii
+    """
+    c = IKEv1Client(cfg)
+    c.log.min_level = LogLevel.ERROR
+
+    # DH keypair required for Aggressive Mode; harmless to generate for Main
+    c._generate_dh_keypair()
+    c.nonce_i = os.urandom(16)
+
+    if mode == "main":
+        sa_pld = c._build_sa_payload_v1(V1_PAYLOAD_NONE)
+        c.sa_payload_bytes = sa_pld
+        total = 28 + len(sa_pld)
+        hdr = c._build_isakmp_header(V1_EXCHANGE_MAIN, 0, 0, V1_PAYLOAD_SA, total)
+        pkt = hdr + sa_pld
+    else:  # aggressive
+        sa_pld    = c._build_sa_payload_v1(V1_PAYLOAD_KE)
+        c.sa_payload_bytes = c._build_sa_payload_v1(V1_PAYLOAD_NONE)  # chain-free copy
+        ke_body   = struct.pack("!HH", cfg.dh_group, 0) + c.dh_pub
+        ke_pld    = struct.pack("!BBH", V1_PAYLOAD_NONCE, 0, 4 + len(ke_body)) + ke_body
+        ni_pld    = struct.pack("!BBH", V1_PAYLOAD_ID,    0, 4 + len(c.nonce_i)) + c.nonce_i
+        idi_pld   = _craft_v1_id(V1_PAYLOAD_NONE, V1_ID_IPV4_ADDR,
+                                  socket.inet_aton(_V1_FUZZ_ID))
+        c.idi_payload_bytes = idi_pld
+        payloads  = sa_pld + ke_pld + ni_pld + idi_pld
+        total     = 28 + len(payloads)
+        hdr = c._build_isakmp_header(V1_EXCHANGE_AGGRESSIVE, 0, 0, V1_PAYLOAD_SA, total)
+        pkt = hdr + payloads
+
+    return pkt, c
+
+
+# ---------------------------------------------------------------------------
+# IKEv1 mutation generators
+# ---------------------------------------------------------------------------
+
+def _v1_offsets(base: bytes, mode: str) -> dict[str, int]:
+    """
+    Return a dict of named byte offsets in a v1 packet.
+    Keys: sa_off, sa_len, and (agg only) ke_off, ke_len, ni_off, ni_len, id_off.
+    """
+    sa_off = 28
+    sa_len = struct.unpack("!H", base[sa_off + 2:sa_off + 4])[0]
+    d = {"sa_off": sa_off, "sa_len": sa_len}
+    if mode == "aggressive" and len(base) > sa_off + sa_len + 4:
+        ke_off = sa_off + sa_len
+        ke_len = struct.unpack("!H", base[ke_off + 2:ke_off + 4])[0]
+        ni_off = ke_off + ke_len
+        ni_len = struct.unpack("!H", base[ni_off + 2:ni_off + 4])[0]
+        id_off = ni_off + ni_len
+        d.update(ke_off=ke_off, ke_len=ke_len,
+                 ni_off=ni_off, ni_len=ni_len, id_off=id_off)
+    return d
+
+
+def _v1_replace_sa(base: bytes, sa_bytes: bytes, mode: str) -> bytes:
+    """Splice `sa_bytes` in place of the original SA payload; patch total length."""
+    sa_off = 28
+    sa_len = struct.unpack("!H", base[sa_off + 2:sa_off + 4])[0]
+    rest   = base[sa_off + sa_len:]    # KE+Nonce+ID for agg, empty for main
+    total  = sa_off + len(sa_bytes) + len(rest)
+    return _set_u32be(base[:sa_off], 24, total) + sa_bytes + rest
+
+
+def _v1_default_attrs(cfg: IKEv1Config) -> bytes:
+    """Return the default set of IKEv1 Phase 1 transform attributes."""
+    attrs  = _v1_tv(V1_ATTR_ENCR, cfg.encr_alg.encr_id)
+    if cfg.encr_alg.encr_id == V1_ENCR_AES_CBC:
+        attrs += _v1_tv(V1_ATTR_KEY_LEN, cfg.encr_alg.key_bits)
+    attrs += _v1_tv(V1_ATTR_HASH,      cfg.hash_info.hash_id)
+    attrs += _v1_tv(V1_ATTR_AUTH,      V1_AUTH_PSK)
+    attrs += _v1_tv(V1_ATTR_GROUP,     cfg.dh_group)
+    attrs += _v1_tv(V1_ATTR_LIFE_TYPE, 1)
+    attrs += _v1_tlv(V1_ATTR_LIFE_DUR, struct.pack("!I", cfg.lifetime))
+    return attrs
+
+
+def gen_v1_header_mutations(base: bytes, mode: str) -> list[FuzzCase]:
+    """Mutate each field of the 28-byte ISAKMP fixed header."""
+    cases: list[FuzzCase] = []
+    real_len = struct.unpack("!I", base[24:28])[0]
+    exch = V1_EXCHANGE_MAIN if mode == "main" else V1_EXCHANGE_AGGRESSIVE
+
+    specs = [
+        ("exch-type-zero",     "Exchange type = 0 (reserved)",
+         _set_u8(base, 18, 0),                              "timeout"),
+        ("exch-type-info",     "Exchange type = 5 (Informational)",
+         _set_u8(base, 18, V1_EXCHANGE_INFO),               "timeout"),
+        ("exch-type-quick",    "Exchange type = 32 (Quick Mode)",
+         _set_u8(base, 18, 32),                             "timeout"),
+        ("exch-type-255",      "Exchange type = 255 (unknown)",
+         _set_u8(base, 18, 255),                            "timeout"),
+        ("exch-type-ikev2",    "Exchange type = 34 (IKEv2 SA_INIT)",
+         _set_u8(base, 18, 34),                             "timeout"),
+        ("version-zero",       "Version = 0x00",
+         _set_u8(base, 17, 0x00),                           "timeout"),
+        ("version-ikev2",      "Version = 0x20 (IKEv2 major)",
+         _set_u8(base, 17, 0x20),                           "timeout"),
+        ("version-ff",         "Version = 0xFF",
+         _set_u8(base, 17, 0xFF),                           "timeout"),
+        ("flags-encrypt",      "Flags = 0x01 (encryption bit set on plaintext msg)",
+         _set_u8(base, 19, V1_FLAG_ENCRYPTION),             "timeout"),
+        ("flags-all",          "Flags = 0xFF (all bits set)",
+         _set_u8(base, 19, 0xFF),                           "timeout"),
+        ("msg-id-nonzero",     "Message ID = 1 (must be 0 for Phase 1 msg 1)",
+         _set_u32be(base, 20, 1),                           "any"),
+        ("msg-id-max",         "Message ID = 0xFFFFFFFF",
+         _set_u32be(base, 20, 0xFFFFFFFF),                  "timeout"),
+        ("length-zero",        "Total length = 0",
+         _set_u32be(base, 24, 0),                           "timeout"),
+        ("length-minus-one",   "Total length = actual − 1",
+         _set_u32be(base, 24, real_len - 1),                "any"),
+        ("length-plus-one",    "Total length = actual + 1",
+         _set_u32be(base, 24, real_len + 1),                "any"),
+        ("length-max",         "Total length = 0xFFFFFFFF",
+         _set_u32be(base, 24, 0xFFFFFFFF),                  "timeout"),
+        ("cookie-i-zeros",     "Cookie I = all zeros (invalid initiator SPI)",
+         _mutate(base, 0, b"\x00" * 8),                     "any"),
+        ("cookie-r-nonzero",   "Cookie R non-zero in request (must be 0)",
+         _mutate(base, 8, b"\xDE\xAD\xBE\xEF\xDE\xAD\xBE\xEF"), "any"),
+        ("next-payload-zero",  "Next payload = 0 (None) — no payloads",
+         _set_u8(_set_u32be(base, 24, 28), 16, 0),          "timeout"),
+        ("next-payload-hash",  "Next payload = 8 (Hash) — skips SA",
+         _set_u8(base, 16, V1_PAYLOAD_HASH),                "any"),
+    ]
+    for name, desc, pkt, exp in specs:
+        cases.append(FuzzCase(0, f"v1-{name}", "header", desc, pkt, exp))
+    return cases
+
+
+def gen_v1_sa_mutations(base: bytes, cfg: IKEv1Config, mode: str) -> list[FuzzCase]:
+    """Mutate the IKEv1 SA payload structure."""
+    cases: list[FuzzCase] = []
+    sa_np = V1_PAYLOAD_KE if mode == "aggressive" else V1_PAYLOAD_NONE
+
+    def _repl(sa_bytes: bytes) -> bytes:
+        return _v1_replace_sa(base, sa_bytes, mode)
+
+    def _norm_xform(override_dh: Optional[int] = None,
+                    override_hash: Optional[int] = None) -> bytes:
+        attrs  = _v1_tv(V1_ATTR_ENCR,  cfg.encr_alg.encr_id)
+        if cfg.encr_alg.encr_id == V1_ENCR_AES_CBC:
+            attrs += _v1_tv(V1_ATTR_KEY_LEN, cfg.encr_alg.key_bits)
+        attrs += _v1_tv(V1_ATTR_HASH,  override_hash or cfg.hash_info.hash_id)
+        attrs += _v1_tv(V1_ATTR_AUTH,  V1_AUTH_PSK)
+        attrs += _v1_tv(V1_ATTR_GROUP, override_dh or cfg.dh_group)
+        attrs += _v1_tv(V1_ATTR_LIFE_TYPE, 1)
+        attrs += _v1_tlv(V1_ATTR_LIFE_DUR, struct.pack("!I", cfg.lifetime))
+        return _v1_transform(1, V1_XFORM_KEY_IKE, attrs, last=True)
+
+    def _norm_prop(override_dh: Optional[int] = None, proto: int = V1_PROTO_ISAKMP,
+                   override_hash: Optional[int] = None) -> bytes:
+        return _v1_proposal(1, proto, [_norm_xform(override_dh, override_hash)])
+
+    # 1. No transforms
+    prop_notx = struct.pack("!BBH", 0, 0, 8) + struct.pack("!BBBB", 1, V1_PROTO_ISAKMP, 0, 0)
+    cases.append(FuzzCase(0, "v1-sa-no-transforms", "sa",
+                          "SA proposal with 0 transforms",
+                          _repl(_craft_v1_sa(sa_np, prop_notx)), "rejected"))
+
+    # 2. Protocol = AH instead of ISAKMP
+    cases.append(FuzzCase(0, "v1-sa-proto-ah", "sa",
+                          "SA proposal Protocol-ID = 2 (AH) instead of 1 (ISAKMP)",
+                          _repl(_craft_v1_sa(sa_np, _norm_prop(proto=2))), "rejected"))
+
+    # 3. Unknown transform ID (not KEY_IKE=1)
+    bad_xform = _v1_transform(1, 255, _v1_default_attrs(cfg), last=True)
+    cases.append(FuzzCase(0, "v1-sa-unknown-xform-id", "sa",
+                          "Transform ID = 255 (only KEY_IKE=1 valid for Phase 1)",
+                          _repl(_craft_v1_sa(sa_np, _v1_proposal(1, V1_PROTO_ISAKMP, [bad_xform]))),
+                          "rejected"))
+
+    # 4. DH group mismatch (SA says group 2, KE carries actual group)
+    alt_dh = 2 if cfg.dh_group != 2 else 5
+    cases.append(FuzzCase(0, "v1-sa-dh-mismatch", "sa",
+                          f"SA proposes DH group {alt_dh} but KE carries DH group {cfg.dh_group}",
+                          _repl(_craft_v1_sa(sa_np, _norm_prop(override_dh=alt_dh))),
+                          "rejected"))
+
+    # 5. Auth method = 3 (RSA signatures) instead of PSK
+    attrs_rsa  = _v1_tv(V1_ATTR_ENCR, cfg.encr_alg.encr_id)
+    if cfg.encr_alg.encr_id == V1_ENCR_AES_CBC:
+        attrs_rsa += _v1_tv(V1_ATTR_KEY_LEN, cfg.encr_alg.key_bits)
+    attrs_rsa += _v1_tv(V1_ATTR_HASH,  cfg.hash_info.hash_id)
+    attrs_rsa += _v1_tv(V1_ATTR_AUTH,  3)   # RSA sig
+    attrs_rsa += _v1_tv(V1_ATTR_GROUP, cfg.dh_group)
+    attrs_rsa += _v1_tv(V1_ATTR_LIFE_TYPE, 1)
+    attrs_rsa += _v1_tlv(V1_ATTR_LIFE_DUR, struct.pack("!I", cfg.lifetime))
+    cases.append(FuzzCase(0, "v1-sa-auth-rsa", "sa",
+                          "Auth method = 3 (RSA sig) — responder configured for PSK",
+                          _repl(_craft_v1_sa(sa_np,
+                              _v1_proposal(1, V1_PROTO_ISAKMP,
+                                           [_v1_transform(1, V1_XFORM_KEY_IKE, attrs_rsa, True)]))),
+                          "rejected"))
+
+    # 6. DOI = 0 (ISAKMP generic, not IPsec)
+    sa_doi0 = struct.pack("!II", 0, V1_SITUATION_ID) + _norm_prop()
+    cases.append(FuzzCase(0, "v1-sa-doi-zero", "sa",
+                          "SA DOI = 0 (ISAKMP generic, not IPsec DOI 1)",
+                          _repl(struct.pack("!BBH", sa_np, 0, 4 + len(sa_doi0)) + sa_doi0),
+                          "any"))
+
+    # 7. Situation = 0
+    sa_sit0 = struct.pack("!II", V1_DOI_IPSEC, 0) + _norm_prop()
+    cases.append(FuzzCase(0, "v1-sa-situation-zero", "sa",
+                          "SA Situation = 0 (SIT_IDENTITY_ONLY is 1)",
+                          _repl(struct.pack("!BBH", sa_np, 0, 4 + len(sa_sit0)) + sa_sit0),
+                          "any"))
+
+    # 8. SA payload length = 0
+    cases.append(FuzzCase(0, "v1-sa-length-zero", "sa",
+                          "SA payload generic header length = 0",
+                          _set_u16be(base, 30, 0), "timeout"))
+
+    # 9. Two proposals: valid first, unknown DH (9999) second
+    prop1      = _norm_prop()
+    prop1_more = _set_u8(prop1, 0, 2)    # more proposals follow
+    prop2      = _norm_prop(override_dh=9999)
+    prop2_num2 = _set_u8(prop2, 4, 2)   # proposal number = 2 (prop body byte 0)
+    cases.append(FuzzCase(0, "v1-sa-two-proposals", "sa",
+                          "Two proposals: valid first, DH-9999 second",
+                          _repl(_craft_v1_sa(sa_np, prop1_more + prop2_num2)), "any"))
+
+    # 10. Empty SA payload (just the DOI+Situation, no proposals)
+    sa_empty = struct.pack("!II", V1_DOI_IPSEC, V1_SITUATION_ID)
+    cases.append(FuzzCase(0, "v1-sa-no-proposal", "sa",
+                          "SA body with DOI+Situation but no Proposal substructure",
+                          _repl(struct.pack("!BBH", sa_np, 0, 4 + len(sa_empty)) + sa_empty),
+                          "rejected"))
+
+    # 11. Unknown hash algorithm (99)
+    cases.append(FuzzCase(0, "v1-sa-unknown-hash", "sa",
+                          "SA transform Hash attribute = 99 (unknown algorithm)",
+                          _repl(_craft_v1_sa(sa_np, _norm_prop(override_hash=99))),
+                          "rejected"))
+
+    # 12. Duplicate transforms in one proposal
+    xf1 = _norm_xform(); xf1 = _set_u8(xf1, 0, 3)   # more=3
+    xf2 = _norm_xform()
+    cases.append(FuzzCase(0, "v1-sa-dup-transform", "sa",
+                          "SA proposal has two identical transforms",
+                          _repl(_craft_v1_sa(sa_np,
+                              _v1_proposal(1, V1_PROTO_ISAKMP, [xf1, xf2]))),
+                          "any"))
+
+    return cases
+
+
+def gen_v1_ke_mutations(base: bytes, cfg: IKEv1Config) -> list[FuzzCase]:
+    """Mutate the KE payload in an Aggressive Mode packet."""
+    cases: list[FuzzCase] = []
+    offs   = _v1_offsets(base, "aggressive")
+    ke_off = offs["ke_off"]
+    ke_len = offs["ke_len"]
+    pubkey_len = ke_len - 8   # header(4) + group(2) + reserved(2)
+
+    def _repl_ke(ke_bytes: bytes) -> bytes:
+        before    = base[:ke_off]
+        after     = base[ke_off + ke_len:]
+        new_total = len(before) + len(ke_bytes) + len(after)
+        return _set_u32be(before, 24, new_total) + ke_bytes + after
+
+    specs = [
+        ("v1-ke-group-zero",     "KE DH group = 0 (reserved)",
+         _craft_ke_payload(V1_PAYLOAD_NONCE, 0, os.urandom(pubkey_len)), "rejected"),
+        ("v1-ke-group-unknown",  "KE DH group = 9999 (unknown)",
+         _craft_ke_payload(V1_PAYLOAD_NONCE, 9999, os.urandom(pubkey_len)), "rejected"),
+        ("v1-ke-pubkey-zeros",   "KE public key = all zeros",
+         _craft_ke_payload(V1_PAYLOAD_NONCE, cfg.dh_group, bytes(pubkey_len)), "any"),
+        ("v1-ke-pubkey-ff",      "KE public key = all 0xFF",
+         _craft_ke_payload(V1_PAYLOAD_NONCE, cfg.dh_group, bytes([0xFF]*pubkey_len)), "any"),
+        ("v1-ke-pubkey-empty",   "KE payload with 0-byte public key",
+         _craft_ke_payload(V1_PAYLOAD_NONCE, cfg.dh_group, b""), "rejected"),
+        ("v1-ke-pubkey-half",    "KE public key = half expected length",
+         _craft_ke_payload(V1_PAYLOAD_NONCE, cfg.dh_group, os.urandom(pubkey_len//2)), "rejected"),
+    ]
+    for name, desc, ke_pld, exp in specs:
+        cases.append(FuzzCase(0, name, "ke", desc, _repl_ke(ke_pld), exp))
+    return cases
+
+
+def gen_v1_nonce_mutations(base: bytes) -> list[FuzzCase]:
+    """Mutate the Nonce payload in an Aggressive Mode packet."""
+    cases: list[FuzzCase] = []
+    offs   = _v1_offsets(base, "aggressive")
+    ni_off = offs["ni_off"]
+    ni_len = offs["ni_len"]
+
+    def _repl_ni(ni_bytes: bytes) -> bytes:
+        before    = base[:ni_off]
+        after     = base[ni_off + ni_len:]
+        new_total = len(before) + len(ni_bytes) + len(after)
+        return _set_u32be(before, 24, new_total) + ni_bytes + after
+
+    specs = [
+        ("v1-nonce-empty",    "Nonce = 0 bytes",
+         struct.pack("!BBH", V1_PAYLOAD_ID, 0, 4), "any"),
+        ("v1-nonce-1byte",    "Nonce = 1 byte (RFC minimum is 8)",
+         struct.pack("!BBH", V1_PAYLOAD_ID, 0, 5) + b"\x42", "any"),
+        ("v1-nonce-zeros",    "Nonce = 16 zero bytes",
+         struct.pack("!BBH", V1_PAYLOAD_ID, 0, 20) + bytes(16), "any"),
+        ("v1-nonce-all-ff",   "Nonce = 16 bytes of 0xFF",
+         struct.pack("!BBH", V1_PAYLOAD_ID, 0, 20) + bytes([0xFF]*16), "any"),
+        ("v1-nonce-huge",     "Nonce = 1024 random bytes",
+         struct.pack("!BBH", V1_PAYLOAD_ID, 0, 1028) + os.urandom(1024), "any"),
+    ]
+    for name, desc, ni_pld, exp in specs:
+        cases.append(FuzzCase(0, name, "nonce", desc, _repl_ni(ni_pld), exp))
+    return cases
+
+
+def gen_v1_id_mutations(base: bytes) -> list[FuzzCase]:
+    """Mutate the IDii payload in an Aggressive Mode packet."""
+    cases: list[FuzzCase] = []
+    offs   = _v1_offsets(base, "aggressive")
+    id_off = offs["id_off"]
+    id_end = len(base)
+    id_len = id_end - id_off
+
+    def _repl_id(id_bytes: bytes) -> bytes:
+        before    = base[:id_off]
+        new_total = len(before) + len(id_bytes)
+        return _set_u32be(before, 24, new_total) + id_bytes
+
+    specs = [
+        ("v1-id-type-zero",    "ID type = 0 (reserved)",
+         _craft_v1_id(V1_PAYLOAD_NONE, 0, socket.inet_aton("127.0.0.1")), "any"),
+        ("v1-id-type-fqdn",    "ID type = 2 (FQDN) instead of IPv4",
+         _craft_v1_id(V1_PAYLOAD_NONE, 2, b"strongswan.example.com"), "any"),
+        ("v1-id-empty-data",   "ID payload with 0 bytes of ID data",
+         _craft_v1_id(V1_PAYLOAD_NONE, V1_ID_IPV4_ADDR, b""), "any"),
+        ("v1-id-wrong-ip",     "ID IPv4 = 0.0.0.0",
+         _craft_v1_id(V1_PAYLOAD_NONE, V1_ID_IPV4_ADDR, b"\x00\x00\x00\x00"), "any"),
+        ("v1-id-length-zero",  "ID payload generic length = 0",
+         _set_u16be(base, id_off + 2, 0), "timeout"),
+        ("v1-id-missing",      "ID payload omitted (packet ends after Nonce)",
+         _repl_id(b""), "rejected"),
+    ]
+    for name, desc, id_pld, exp in specs:
+        cases.append(FuzzCase(0, name, "id", desc,
+                              _repl_id(id_pld) if name != "v1-id-length-zero" else id_pld,
+                              exp))
+    return cases
+
+
+def gen_v1_payload_chain_mutations(base: bytes, mode: str) -> list[FuzzCase]:
+    """Corrupt payload-chain pointers and add/remove payloads."""
+    cases: list[FuzzCase] = []
+
+    def _rebuild_v1(body: bytes) -> bytes:
+        return _set_u32be(base[:28], 24, 28 + len(body)) + body
+
+    # --- mutations common to Main and Aggressive ---
+
+    # Header next_payload = 0 (skip SA entirely)
+    hdr_np0 = _set_u8(_set_u32be(base, 24, 28), 16, 0)
+    cases.append(FuzzCase(0, "v1-chain-no-payloads", "payload",
+                          "Header next_payload = 0 — no payloads at all",
+                          hdr_np0, "timeout"))
+
+    # Header next_payload = unknown type 200
+    cases.append(FuzzCase(0, "v1-chain-nxt-unknown", "payload",
+                          "Header next_payload = 200 (unknown type)",
+                          _set_u8(base, 16, 200), "any"))
+
+    # SA critical bit set
+    cases.append(FuzzCase(0, "v1-chain-sa-critical", "payload",
+                          "SA payload reserved byte = 0x80 (critical bit analog)",
+                          _set_u8(base, 29, 0x80), "any"))
+
+    # SA length = 0xFFFF
+    cases.append(FuzzCase(0, "v1-chain-sa-len-ffff", "payload",
+                          "SA payload length = 0xFFFF",
+                          _set_u16be(base, 30, 0xFFFF), "timeout"))
+
+    if mode == "main":
+        # Append a spurious Hash payload after SA
+        sa_len = struct.unpack("!H", base[30:32])[0]
+        # Patch SA next_payload to point to Hash
+        pkt = _set_u8(base, 28, V1_PAYLOAD_HASH)
+        hash_pld = struct.pack("!BBH", V1_PAYLOAD_NONE, 0, 8) + bytes(4)
+        pkt = _set_u32be(pkt, 24, len(pkt) + len(hash_pld)) + hash_pld
+        cases.append(FuzzCase(0, "v1-chain-spurious-hash", "payload",
+                              "Spurious Hash payload appended after SA in Main Mode",
+                              pkt, "any"))
+
+        # Duplicate SA
+        sa_bytes  = base[28:]
+        sa_1      = _set_u8(sa_bytes, 0, V1_PAYLOAD_SA)   # first SA → second SA
+        cases.append(FuzzCase(0, "v1-chain-dup-sa", "payload",
+                              "Two identical SA payloads in chain",
+                              _rebuild_v1(sa_1 + sa_bytes), "any"))
+
+    else:  # aggressive
+        offs   = _v1_offsets(base, "aggressive")
+        sa_off = offs["sa_off"];  sa_len = offs["sa_len"]
+        ke_off = offs["ke_off"];  ke_len = offs["ke_len"]
+        ni_off = offs["ni_off"];  ni_len = offs["ni_len"]
+        id_off = offs["id_off"]
+
+        sa_b = base[sa_off:ke_off]
+        ke_b = base[ke_off:ni_off]
+        ni_b = base[ni_off:id_off]
+        id_b = base[id_off:]
+
+        # SA missing: header starts at KE
+        new_hdr = _set_u8(base[:28], 16, V1_PAYLOAD_KE)
+        cases.append(FuzzCase(0, "v1-chain-sa-missing", "payload",
+                              "SA payload omitted; chain starts at KE",
+                              _set_u32be(new_hdr, 24, 28+ke_len+ni_len+(len(base)-id_off))
+                              + ke_b + ni_b + id_b, "rejected"))
+
+        # KE missing: SA next_payload → Nonce
+        sa_skip_ke = _set_u8(sa_b, 0, V1_PAYLOAD_NONCE)
+        cases.append(FuzzCase(0, "v1-chain-ke-missing", "payload",
+                              "KE payload omitted; SA next_payload → Nonce",
+                              _rebuild_v1(sa_skip_ke + ni_b + id_b), "rejected"))
+
+        # Nonce missing: KE next_payload → ID
+        ke_skip_ni = _set_u8(ke_b, 0, V1_PAYLOAD_ID)
+        cases.append(FuzzCase(0, "v1-chain-nonce-missing", "payload",
+                              "Nonce payload omitted; KE next_payload → ID",
+                              _rebuild_v1(sa_b + ke_skip_ni + id_b), "rejected"))
+
+        # ID missing: Nonce next_payload = 0
+        ni_no_id = _set_u8(ni_b, 0, V1_PAYLOAD_NONE)
+        cases.append(FuzzCase(0, "v1-chain-id-missing", "payload",
+                              "IDii payload omitted; Nonce next_payload = None",
+                              _rebuild_v1(sa_b + ke_b + ni_no_id), "rejected"))
+
+        # Payload order: SA, Nonce, KE, ID
+        sa_to_ni  = _set_u8(sa_b, 0, V1_PAYLOAD_NONCE)
+        ni_to_ke  = _set_u8(ni_b, 0, V1_PAYLOAD_KE)
+        ke_to_id  = _set_u8(ke_b, 0, V1_PAYLOAD_ID)
+        cases.append(FuzzCase(0, "v1-chain-order-sa-ni-ke-id", "payload",
+                              "Payload order: SA, Nonce, KE, ID (non-standard)",
+                              _rebuild_v1(sa_to_ni + ni_to_ke + ke_to_id + id_b), "any"))
+
+        # Spurious VendorID before ID
+        vid = struct.pack("!BBH", V1_PAYLOAD_ID, 0, 12) + b"FUZZ" * 2
+        ni_to_vid = _set_u8(ni_b, 0, V1_PAYLOAD_VID)
+        cases.append(FuzzCase(0, "v1-chain-extra-vid", "payload",
+                              "Spurious VendorID payload inserted before IDii",
+                              _rebuild_v1(sa_b + ke_b + ni_to_vid + vid + id_b), "any"))
+
+    return cases
+
+
+# ---------------------------------------------------------------------------
+# IKEv1 field labelling (for random mutations)
+# ---------------------------------------------------------------------------
+
+def _label_offsets_v1(pkt: bytes, mode: str) -> dict[int, str]:
+    """Map byte offset → field name for an IKEv1 Phase 1 Message 1 packet."""
+    labels: dict[int, str] = {}
+    if len(pkt) < 28:
+        return labels
+
+    for i in range(8): labels[i]     = f"ISAKMP CookieI[{i}]"
+    for i in range(8): labels[8+i]   = f"ISAKMP CookieR[{i}]"
+    labels[16] = "ISAKMP next-payload"
+    labels[17] = "ISAKMP version"
+    labels[18] = "ISAKMP exchange-type"
+    labels[19] = "ISAKMP flags"
+    for i in range(4): labels[20+i]  = f"ISAKMP msg-id[{i}]"
+    for i in range(4): labels[24+i]  = f"ISAKMP total-len[{i}]"
+
+    # Walk payload chain
+    cur = pkt[16]
+    off = 28
+    V1_NAMES = V1_PAYLOAD_NAMES
+    while cur != V1_PAYLOAD_NONE and off + 4 <= len(pkt):
+        nxt  = pkt[off]
+        plen = struct.unpack("!H", pkt[off+2:off+4])[0]
+        if plen < 4 or off + plen > len(pkt):
+            break
+        pname = V1_NAMES.get(cur, f"pld{cur}")
+        labels[off]   = f"{pname} next-payload"
+        labels[off+1] = f"{pname} reserved"
+        labels[off+2] = f"{pname} length[0]"
+        labels[off+3] = f"{pname} length[1]"
+        body_s = off + 4
+        body_e = off + plen
+        if cur == V1_PAYLOAD_SA:
+            for i in range(4): labels[body_s+i]   = f"SA DOI[{i}]"
+            for i in range(4): labels[body_s+4+i] = f"SA Situation[{i}]"
+            # mark proposal header bytes
+            if body_s + 12 <= body_e:
+                for i, n in enumerate(("last/more","reserved","length[0]","length[1]",
+                                        "prop-num","proto-id","spi-size","num-xforms")):
+                    if body_s+8+i < body_e:
+                        labels[body_s+8+i] = f"SA-prop1 {n}"
+        elif cur == V1_PAYLOAD_KE:
+            if body_s + 4 <= body_e:
+                labels[body_s]   = "KE DH-group[0]"
+                labels[body_s+1] = "KE DH-group[1]"
+                labels[body_s+2] = "KE reserved[0]"
+                labels[body_s+3] = "KE reserved[1]"
+                for i in range(body_s+4, body_e):
+                    labels[i] = f"KE pubkey[{i-body_s-4}]"
+        elif cur == V1_PAYLOAD_NONCE:
+            for i in range(body_s, body_e):
+                labels[i] = f"Nonce data[{i-body_s}]"
+        elif cur == V1_PAYLOAD_ID:
+            if body_s < body_e:
+                labels[body_s]   = "ID type"
+                labels[body_s+1] = "ID proto"
+                labels[body_s+2] = "ID port[0]"
+                labels[body_s+3] = "ID port[1]"
+                for i in range(body_s+4, body_e):
+                    labels[i] = f"ID data[{i-body_s-4}]"
+        cur = nxt
+        off += plen
+    return labels
+
+
+def gen_v1_random_mutations(base: bytes, n: int, seed: int,
+                             mode: str) -> list[FuzzCase]:
+    """Random byte flips for an IKEv1 packet, with field labels."""
+    labels = _label_offsets_v1(base, mode)
+    rng    = random.Random(seed ^ 0xDEAD)   # different seed space from IKEv2
+    cases: list[FuzzCase] = []
+    for i in range(n):
+        pkt      = bytearray(base)
+        count    = rng.randint(1, 4)
+        offsets  = [rng.randint(0, len(base) - 1) for _ in range(count)]
+        orig_vals = [pkt[o] for o in offsets]
+        new_vals  = [rng.randint(0, 255) for _ in offsets]
+        for o, v in zip(offsets, new_vals):
+            pkt[o] = v
+        mutations = [
+            {"offset": o, "field": labels.get(o, f"byte[{o}]"),
+             "original": f"0x{ov:02x}", "modified": f"0x{nv:02x}"}
+            for o, ov, nv in zip(offsets, orig_vals, new_vals)
+        ]
+        desc = "Random v1 flip: " + ", ".join(
+            f"[{m['offset']} {m['field']}] {m['original']}→{m['modified']}"
+            for m in mutations
+        )
+        cases.append(FuzzCase(0, f"v1-random-{i:03d}", "random",
+                              desc, bytes(pkt), "any", mutations))
+    return cases
+
+
+# ---------------------------------------------------------------------------
+# IKEv1 response classification
+# ---------------------------------------------------------------------------
+
+V1_KNOWN_NOTIFY: dict[int, str] = {
+    1:  "INVALID_PAYLOAD_TYPE",
+    2:  "DOI_NOT_SUPPORTED",
+    3:  "SITUATION_NOT_SUPPORTED",
+    4:  "INVALID_COOKIE",
+    5:  "INVALID_MAJOR_VERSION",
+    6:  "INVALID_MINOR_VERSION",
+    7:  "INVALID_EXCHANGE_TYPE",
+    8:  "INVALID_FLAGS",
+    9:  "INVALID_MESSAGE_ID",
+    10: "INVALID_PROTOCOL_ID",
+    11: "INVALID_SPI",
+    12: "INVALID_TRANSFORM_ID",
+    13: "ATTRIBUTES_NOT_SUPPORTED",
+    14: "NO_PROPOSAL_CHOSEN",
+    15: "BAD_PROPOSAL_SYNTAX",
+    16: "PAYLOAD_MALFORMED",
+    17: "INVALID_KEY_INFORMATION",
+    24: "AUTHENTICATION_FAILED",
+    29: "UNSUPPORTED_EXCHANGE_TYPE",
+    30: "UNEQUAL_PAYLOAD_LENGTHS",
+}
+
+
+def classify_v1(resp: bytes, cookie_i: bytes,
+                mode: str) -> tuple[str, Optional[int], str]:
+    """
+    Classify an IKEv1 Phase 1 response.
+
+    verdict:
+      accepted    — responder assigned a Cookie R (non-zero) and sent the
+                    expected exchange type back; handshake may continue
+      rejected    — Informational exchange (type 5) with a Notify payload,
+                    or SA with no/zero Cookie R and no error notifies
+      interesting — valid ISAKMP framing but unexpected exchange type,
+                    Cookie I mismatch, or ambiguous combination
+      malformed   — < 28 bytes
+    """
+    if len(resp) < 28:
+        return "malformed", None, f"response {len(resp)}B < 28"
+
+    r_cookie_i = resp[0:8]
+    r_cookie_r = resp[8:16]
+    r_nxt      = resp[16]
+    r_ver      = resp[17]
+    r_exch     = resp[18]
+    r_flags    = resp[19]
+    r_len      = struct.unpack("!I", resp[24:28])[0]
+    expected_exch = V1_EXCHANGE_MAIN if mode == "main" else V1_EXCHANGE_AGGRESSIVE
+
+    notes_parts: list[str] = []
+    if r_cookie_i != cookie_i:
+        notes_parts.append(f"CookieI mismatch")
+    if r_ver != 0x10:
+        notes_parts.append(f"version 0x{r_ver:02x}")
+
+    # Walk payload chain to collect Notify types
+    notify_types: list[int] = []
+    cap  = min(r_len, len(resp))
+    if cap > 28 and r_nxt != V1_PAYLOAD_NONE:
+        body = resp[28:cap]
+        cur  = r_nxt
+        poff = 0
+        while cur != V1_PAYLOAD_NONE and poff + 4 <= len(body):
+            nxt  = body[poff]
+            plen = struct.unpack("!H", body[poff+2:poff+4])[0]
+            if plen < 4 or poff + plen > len(body):
+                break
+            if cur == V1_PAYLOAD_NOTIFY and plen >= 12:
+                # Notify body: DOI(4) proto(1) spi_size(1) type(2) ...
+                # generic header already skipped by poff+4 baseline
+                n_type = struct.unpack("!H", body[poff+10:poff+12])[0]
+                notify_types.append(n_type)
+            poff += plen
+            cur   = nxt
+
+    if notify_types:
+        notes_parts.append("notify: " + ", ".join(
+            V1_KNOWN_NOTIFY.get(t, str(t)) for t in notify_types
+        ))
+
+    # Informational exchange = error response
+    if r_exch == V1_EXCHANGE_INFO:
+        primary = notify_types[0] if notify_types else None
+        return "rejected", primary, " | ".join(notes_parts) or "Informational"
+
+    # Expected exchange type with correct Cookie I
+    if r_exch == expected_exch and r_cookie_i == cookie_i:
+        if r_cookie_r != b"\x00" * 8:
+            return "accepted", None, " | ".join(notes_parts) or "SA response"
+        return "interesting", None, \
+               " | ".join(notes_parts) or "Cookie R = 0 in response"
+
+    notes_parts.append(f"unexpected exchange type {r_exch}")
+    return "interesting", notify_types[0] if notify_types else None, \
+           " | ".join(notes_parts)
+
+
+# ---------------------------------------------------------------------------
+# IKEv1 fuzzing loop
+# ---------------------------------------------------------------------------
+
+V1_STRATEGIES_MAIN = ("header", "sa", "payload", "truncate", "random")
+V1_STRATEGIES_AGG  = ("header", "sa", "ke", "nonce", "id", "payload", "truncate", "random")
+
+
+def run_fuzzer_v1(
+    cfg:         IKEv1Config,
+    host:        str,
+    port:        int,
+    mode:        str,
+    strategies:  list[str],
+    rounds:      int,
+    seed:        int,
+    delay:       float,
+    timeout:     float,
+    report_path: Optional[str],
+    verbose:     bool,
+    color:       bool,
+) -> list[FuzzResult]:
+    """IKEv1 analogue of run_fuzzer — builds an IKEv1 Message 1 and fuzzes it."""
+    use_color = color and sys.stdout.isatty()
+
+    def _cprint(text: str, verdict: str) -> str:
+        if not use_color:
+            return text
+        return VERDICT_COLOR.get(verdict, "") + text + RESET
+
+    mode_label = "Main Mode" if mode == "main" else "Aggressive Mode"
+    print(f"\nBuilding base IKEv1 {mode_label} Message 1 "
+          f"({cfg.encr}, DH-{cfg.dh_group}) …")
+    base_pkt, client = build_base_packet_v1(cfg, mode)
+    print(f"  Base packet: {len(base_pkt)} bytes  CookieI={base_pkt[:8].hex()}")
+
+    all_cases: list[FuzzCase] = []
+    valid_strats = V1_STRATEGIES_AGG if mode == "aggressive" else V1_STRATEGIES_MAIN
+    for s in strategies:
+        if s == "header":   all_cases += gen_v1_header_mutations(base_pkt, mode)
+        elif s == "sa":     all_cases += gen_v1_sa_mutations(base_pkt, cfg, mode)
+        elif s == "ke"  and mode == "aggressive": all_cases += gen_v1_ke_mutations(base_pkt, cfg)
+        elif s == "nonce" and mode == "aggressive": all_cases += gen_v1_nonce_mutations(base_pkt)
+        elif s == "id"  and mode == "aggressive": all_cases += gen_v1_id_mutations(base_pkt)
+        elif s == "payload": all_cases += gen_v1_payload_chain_mutations(base_pkt, mode)
+        elif s == "truncate": all_cases += gen_truncation_cases(base_pkt)
+        elif s == "random" and rounds > 0:
+            all_cases += gen_v1_random_mutations(base_pkt, rounds, seed, mode)
+
+    for i, c in enumerate(all_cases, 1):
+        c.seq = i
+    total = len(all_cases)
+
+    print(f"  Strategies   : {', '.join(s for s in strategies if s in valid_strats)}"
+          + (f" + random×{rounds}" if rounds and "random" in strategies else ""))
+    print(f"  Total cases  : {total}")
+    print(f"  Target       : {host}:{port}  timeout={timeout}s\n")
+    print(f"  {'#':>4}  {'Category':<10}  {'Name':<35}  {'Verdict':<14}  Notes")
+    print(f"  {'─'*4}  {'─'*10}  {'─'*35}  {'─'*14}  {'─'*30}")
+
+    results: list[FuzzResult] = []
+    for case in all_cases:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        t0 = time.monotonic()
+        resp: Optional[bytes] = None
+        try:
+            sock.sendto(case.pkt, (host, port))
+            resp, _ = sock.recvfrom(65536)
+        except socket.timeout:
+            pass
+        finally:
+            sock.close()
+        elapsed_ms = (time.monotonic() - t0) * 1000
+
+        if resp is None:
+            r = FuzzResult(case, None, elapsed_ms, "timeout", None, "")
+        else:
+            verdict, ntype, notes = classify_v1(resp, case.pkt[:8], mode)
+            r = FuzzResult(case, resp, elapsed_ms, verdict, ntype, notes)
+            if verbose:
+                print(_hex_dump(resp, indent=6))
+        results.append(r)
+
+        v_str = r.verdict.upper()
+        if r.notify_type is not None:
+            v_str += f" ({V1_KNOWN_NOTIFY.get(r.notify_type, str(r.notify_type))})"
+        flag = "*** " if r.interesting else "    "
+        line = (f"  {flag}{case.seq:>3}  {case.category:<10}  "
+                f"{case.name:<35}  {r.verdict.upper():<14}  {r.notes}")
+        print(_cprint(line, r.verdict))
+        if case.category == "random" and case.mutations:
+            for m in case.mutations:
+                print(f"              [{m['offset']:3d} {m['field']}]"
+                      f"  {m['original']} → {m['modified']}")
+        if delay > 0:
+            time.sleep(delay)
+
+    tally: dict[str, int] = {}
+    for r in results:
+        tally[r.verdict] = tally.get(r.verdict, 0) + 1
+    interesting = [r for r in results if r.interesting]
+
+    bar = "─" * 60
+    print(f"\n{bar}")
+    print(f"  IKEv1 {mode_label} fuzzing summary")
+    print(bar)
+    print(f"  Cases sent   : {total}")
+    for v in ("accepted", "rejected", "timeout", "interesting", "malformed"):
+        if tally.get(v, 0):
+            print(_cprint(f"  {v.capitalize():<14}: {tally[v]}", v))
+
+    if interesting:
+        print(f"\n  *** {len(interesting)} INTERESTING finding(s):")
+        for r in interesting:
+            print(f"    [{r.case.seq:>3}] {r.case.name:<36}  "
+                  f"expected={r.case.expected}  got={r.verdict}")
+            print(f"          {r.case.description}")
+            if r.notes:
+                print(f"          {r.notes}")
+    else:
+        print("\n  No unexpected findings.")
+    print(bar)
+
+    if report_path:
+        report = {
+            "target":    f"{host}:{port}",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ike_version": 1,
+            "mode":      mode,
+            "config":    {"encr": cfg.encr, "hash": cfg.hash_alg,
+                          "dh_group": cfg.dh_group, "psk": "***"},
+            "strategies": strategies,
+            "rounds":    rounds,
+            "seed":      seed,
+            "summary":   dict(total=total, **tally,
+                              interesting_findings=len(interesting)),
+            "findings":  [r.to_dict() for r in interesting],
+            "all":       [r.to_dict() for r in results],
+        }
+        with open(report_path, "w") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"\n  Report saved → {report_path}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Response classification
 # ---------------------------------------------------------------------------
 
@@ -893,7 +1755,8 @@ def send_case(case: FuzzCase, host: str, port: int,
 # Main fuzzing loop
 # ---------------------------------------------------------------------------
 
-STRATEGIES = ("header", "sa", "ke", "nonce", "payload", "truncate", "random")
+STRATEGIES    = ("header", "sa", "ke", "nonce", "payload", "truncate", "random")
+V1_STRATEGIES = ("header", "sa", "ke", "nonce", "id", "payload", "truncate", "random")
 
 VERDICT_COLOR = {
     "accepted":    "\033[32m",  # green
@@ -1044,9 +1907,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ike_fuzzer.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent("""\
-            IKEv2 protocol fuzzer — mutates IKE_SA_INIT packets and probes a responder.
+            IKEv1/IKEv2 protocol fuzzer — mutates Phase 1 packets and probes a responder.
 
-            Strategies:
+            Strategies (IKEv2):
               header   — IKE fixed header fields (exchange type, flags, length, SPIs, …)
               sa       — SA payload transforms and proposal structure
               ke       — KE payload DH group and public key
@@ -1055,78 +1918,127 @@ def build_parser() -> argparse.ArgumentParser:
               truncate — Send packet truncated at various offsets
               random   — Random byte flips (count set by --rounds)
 
+            Strategies (IKEv1, adds):
+              id       — IDii payload mutations (Aggressive Mode only)
+              ke/nonce — apply to Aggressive Mode only; skipped in Main Mode
+
             Examples:
               %(prog)s 10.0.0.1
-              %(prog)s 10.0.0.1 --strategy header,sa,ke --rounds 0
+              %(prog)s 10.0.0.1 --ike-version 1 --mode aggressive
+              %(prog)s 10.0.0.1 --ike-version 1 --mode main --strategy header,sa --rounds 0
               %(prog)s 10.0.0.1 --rounds 100 --seed 42 --report out.json
         """),
     )
     p.add_argument("host", help="Responder IP address or hostname")
-    p.add_argument("-p", "--port",     type=int,   default=500)
-    p.add_argument("--encr",          default="aes-cbc-256",
-                   choices=["aes-cbc-128","aes-cbc-256","aes-gcm-128","aes-gcm-256","3des"])
-    p.add_argument("--prf",           default="hmac-sha256",
-                   choices=["hmac-sha1","hmac-sha256","hmac-sha384","hmac-sha512"])
-    p.add_argument("--integ",         default="hmac-sha256-128",
-                   choices=["hmac-md5-96","hmac-sha1-96","hmac-sha256-128",
-                             "hmac-sha384-192","hmac-sha512-256"])
-    p.add_argument("--dh-group",      type=int,   default=14,
-                   choices=[2, 5, 14, 19, 20, 21])
-    p.add_argument("--psk",           default="secret")
-    p.add_argument("--strategy",      default=",".join(STRATEGIES),
+    p.add_argument("-p", "--port",        type=int,   default=500)
+    p.add_argument("--ike-version",       type=int,   default=2, choices=[1, 2],
+                   help="IKE version to fuzz (default: 2)")
+    p.add_argument("--mode",             default="main", choices=["main", "aggressive"],
+                   help="IKEv1 Phase 1 mode (default: main; ignored for IKEv2)")
+
+    # IKEv2 algorithm options
+    v2 = p.add_argument_group("IKEv2 algorithm options (ignored when --ike-version 1)")
+    v2.add_argument("--encr",   default="aes-cbc-256",
+                    choices=["aes-cbc-128","aes-cbc-256","aes-gcm-128","aes-gcm-256","3des"])
+    v2.add_argument("--prf",    default="hmac-sha256",
+                    choices=["hmac-sha1","hmac-sha256","hmac-sha384","hmac-sha512"])
+    v2.add_argument("--integ",  default="hmac-sha256-128",
+                    choices=["hmac-md5-96","hmac-sha1-96","hmac-sha256-128",
+                              "hmac-sha384-192","hmac-sha512-256"])
+
+    # IKEv1 algorithm options
+    v1 = p.add_argument_group("IKEv1 algorithm options (ignored when --ike-version 2)")
+    v1.add_argument("--v1-encr", default="aes-cbc-256",
+                    choices=sorted(V1_ENCR_ALGORITHMS),
+                    help="IKEv1 encryption algorithm (default: aes-cbc-256)")
+    v1.add_argument("--hash",    default="sha1",
+                    choices=sorted(V1_HASH_ALGORITHMS),
+                    help="IKEv1 hash/PRF algorithm (default: sha1)")
+
+    p.add_argument("--dh-group",   type=int,   default=14, choices=[2, 5, 14, 19, 20, 21])
+    p.add_argument("--psk",        default="secret")
+    p.add_argument("--strategy",   default=",".join(STRATEGIES),
                    help="Comma-separated strategy list (default: all)")
-    p.add_argument("--rounds",        type=int,   default=20,
+    p.add_argument("--rounds",     type=int,   default=20,
                    help="Number of random-mutation cases (0 = skip random, default: 20)")
-    p.add_argument("--seed",          type=int,   default=1337,
+    p.add_argument("--seed",       type=int,   default=1337,
                    help="RNG seed for random mutations (default: 1337)")
-    p.add_argument("--delay",         type=float, default=0.05,
+    p.add_argument("--delay",      type=float, default=0.05,
                    help="Seconds between sends (default: 0.05)")
-    p.add_argument("--timeout",       type=float, default=2.0,
+    p.add_argument("--timeout",    type=float, default=2.0,
                    help="UDP response timeout per case (default: 2.0)")
-    p.add_argument("--report",        metavar="FILE",
+    p.add_argument("--report",     metavar="FILE",
                    help="Save JSON report to FILE")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Hex-dump each response")
-    p.add_argument("--no-color",      action="store_true",
+    p.add_argument("--no-color",   action="store_true",
                    help="Disable ANSI colour output")
     return p
 
 
 def main() -> None:
-    """Parse CLI arguments and invoke run_fuzzer with the requested configuration."""
+    """Parse CLI arguments and invoke the appropriate fuzzer."""
     parser = build_parser()
     args   = parser.parse_args()
 
     strategies = [s.strip() for s in args.strategy.split(",") if s.strip()]
-    unknown = [s for s in strategies if s not in STRATEGIES]
+    valid_set  = V1_STRATEGIES if args.ike_version == 1 else STRATEGIES
+    unknown    = [s for s in strategies if s not in valid_set]
     if unknown:
         parser.error(f"Unknown strategy/strategies: {', '.join(unknown)}. "
-                     f"Valid: {', '.join(STRATEGIES)}")
+                     f"Valid: {', '.join(valid_set)}")
 
-    cfg = IKEConfig(
-        host      = args.host,
-        port      = args.port,
-        encr      = args.encr,
-        integ     = args.integ,
-        prf       = args.prf,
-        dh_group  = args.dh_group,
-        psk       = args.psk,
-        verbose   = args.verbose,
-    )
-
-    run_fuzzer(
-        cfg         = cfg,
-        host        = args.host,
-        port        = args.port,
-        strategies  = strategies,
-        rounds      = args.rounds,
-        seed        = args.seed,
-        delay       = args.delay,
-        timeout     = args.timeout,
-        report_path = args.report,
-        verbose     = args.verbose,
-        color       = not args.no_color,
-    )
+    if args.ike_version == 1:
+        try:
+            cfg = IKEv1Config(
+                host     = args.host,
+                port     = args.port,
+                encr     = args.v1_encr,
+                hash_alg = args.hash,
+                dh_group = args.dh_group,
+                psk      = args.psk,
+                mode     = args.mode,
+            )
+        except ValueError as e:
+            parser.error(str(e))
+        run_fuzzer_v1(
+            cfg         = cfg,
+            host        = args.host,
+            port        = args.port,
+            mode        = args.mode,
+            strategies  = strategies,
+            rounds      = args.rounds,
+            seed        = args.seed,
+            delay       = args.delay,
+            timeout     = args.timeout,
+            report_path = args.report,
+            verbose     = args.verbose,
+            color       = not args.no_color,
+        )
+    else:
+        cfg = IKEConfig(
+            host     = args.host,
+            port     = args.port,
+            encr     = args.encr,
+            integ    = args.integ,
+            prf      = args.prf,
+            dh_group = args.dh_group,
+            psk      = args.psk,
+            verbose  = args.verbose,
+        )
+        run_fuzzer(
+            cfg         = cfg,
+            host        = args.host,
+            port        = args.port,
+            strategies  = strategies,
+            rounds      = args.rounds,
+            seed        = args.seed,
+            delay       = args.delay,
+            timeout     = args.timeout,
+            report_path = args.report,
+            verbose     = args.verbose,
+            color       = not args.no_color,
+        )
 
 
 if __name__ == "__main__":
