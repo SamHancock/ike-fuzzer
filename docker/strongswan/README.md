@@ -6,7 +6,7 @@ pre-shared-key authentication for testing the IKE client.
 ## Build & run
 
 ```bash
-cd docker
+cd docker/strongswan
 docker build -t ike-test-swan .
 docker run --rm --network host --name swan-test ike-test-swan
 ```

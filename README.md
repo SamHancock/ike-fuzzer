@@ -21,7 +21,8 @@ authentication, plus a structured protocol fuzzer.
 | Protocol fuzzer — IKEv1 Main Mode | Working — ~48 cases across 4 categories |
 | Protocol fuzzer — IKEv1 Aggressive Mode | Working — ~69 cases across 7 categories |
 | Protocol fuzzer — random byte-flip | Working — reproducible via `--seed`, IKEv1/v2 field-labelled |
-| strongSwan Docker test environment | Available — `docker/` subdirectory |
+| strongSwan Docker test environment | Available — `docker/strongswan/` |
+| SoftEther VPN Docker test environment | Available — `docker/softether/` |
 
 ## Files
 
@@ -30,7 +31,8 @@ authentication, plus a structured protocol fuzzer.
 | `ike_client.py` | IKEv1 / IKEv2 client — select with `--version 1` or `--version 2` |
 | `ike_fuzzer.py` | Protocol fuzzer — IKEv1 and IKEv2 structured and random mutations |
 | `requirements.txt` | Python dependencies |
-| `docker/` | strongSwan 5.9 responder for local testing (see below) |
+| `docker/strongswan/` | strongSwan 5.9 responder — IKEv1 + IKEv2, all algorithm variants |
+| `docker/softether/` | SoftEther VPN 4.44 responder — IKEv1 only, pure userspace |
 
 ## Setup
 
@@ -41,20 +43,22 @@ venv/bin/pip install -r requirements.txt
 
 ---
 
-## Docker test environment
+## Docker test environments
 
-The `docker/` directory contains a strongSwan 5.9 responder pre-configured for all
-supported algorithm combinations, listening on `127.0.0.1:500`.
+Two responder containers are provided under `docker/`. Both use host networking
+and PSK **`secret`**.
 
-### Build and run
+### strongSwan 5.9 (`docker/strongswan/`)
+
+Full IKEv1 + IKEv2 responder. Binds to `127.0.0.1:500` only.
 
 ```bash
-cd docker
+cd docker/strongswan
 docker build -t ike-test-swan .
 docker run --rm --network host --name swan-test ike-test-swan
 ```
 
-### Pre-configured connections
+Pre-configured connections:
 
 | Name | Version | Mode | Proposals |
 |------|---------|------|-----------|
@@ -64,16 +68,35 @@ docker run --rm --network host --name swan-test ike-test-swan
 | `ikev2-psk-gcm` | IKEv2 | — | AES-256-GCM + PRF-SHA-256 + MODP-2048 |
 | `ikev2-gcm-sha512` | IKEv2 | — | AES-256-GCM + PRF-SHA-512 + ECP-521 |
 
-PSK for all connections: **`secret`**
-
-### Notes
-
+Notes:
 - `interfaces_use = lo` — charon binds to loopback only.
 - `i_dont_care_about_security_and_use_aggressive_mode_psk = yes` — required by
-  strongSwan ≥ 5.4 to allow Aggressive Mode with PSK (disabled by default due to
-  offline dictionary-attack exposure).
-- `libstrongswan-standard-plugins` and `libstrongswan-extra-plugins` provide the
-  `gcm` and `openssl` plugins needed for AES-GCM and elliptic-curve DH.
+  strongSwan ≥ 5.4 to allow Aggressive Mode with PSK.
+- `libstrongswan-standard-plugins` and `libstrongswan-extra-plugins` provide
+  AES-GCM and elliptic-curve DH support.
+
+### SoftEther VPN 4.44 (`docker/softether/`)
+
+IKEv1-only responder with L2TP/IPSec. Entirely userspace — no kernel IPSec
+modules or special Docker capabilities needed. Binds to `0.0.0.0:500`.
+
+```bash
+cd docker/softether
+docker build -t ike-test-softether .   # compiles from source, ~3 min
+docker run --rm --network host --name softether-test ike-test-softether
+```
+
+Supported algorithms (v4.44 enforces MODP-2048 as the minimum DH group):
+
+| Encryption | Hash | DH group | Main Mode | Aggressive Mode |
+|------------|------|----------|-----------|-----------------|
+| AES-256-CBC | SHA-1 / SHA-256 | 14 (MODP-2048) | ✓ | ✓ |
+| AES-128-CBC | SHA-1 | 14 (MODP-2048) | ✓ | ✓ |
+| 3DES | any | any | ✗ | ✗ |
+| any | any | ≤ 5 (MODP-1536) | ✗ | ✗ |
+
+Configuration can be overridden with environment variables (`SE_PSK`, `SE_USER`,
+`SE_PASS`, `SE_HUB`). See `docker/softether/README.md` for details.
 
 ---
 
