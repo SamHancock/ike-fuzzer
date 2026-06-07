@@ -5,7 +5,7 @@ authentication, plus a structured protocol fuzzer.
 
 - **IKEv2** (RFC 7296) — full `IKE_SA_INIT` / `IKE_AUTH` exchange
 - **IKEv1** (RFC 2408 / RFC 2409) — Phase 1 Main Mode (6-message) and Aggressive Mode (3-message)
-- **Fuzzer** — 66 structured mutation cases + configurable random byte-flip rounds
+- **Fuzzer** — IKEv1 (Main + Aggressive) and IKEv2 structured mutations + configurable random byte-flip rounds
 
 ## Project status
 
@@ -17,8 +17,10 @@ authentication, plus a structured protocol fuzzer.
 | IKEv1 Main Mode (6-message) | Working |
 | IKEv1 Aggressive Mode (3-message) | Working |
 | IKEv1 ECDH (P-521 / group 21) | Working |
-| Protocol fuzzer — structured mutations | Working — 66 cases across 6 categories |
-| Protocol fuzzer — random byte-flip | Working — reproducible via `--seed` |
+| Protocol fuzzer — IKEv2 structured mutations | Working — 66 cases across 6 categories |
+| Protocol fuzzer — IKEv1 Main Mode | Working — ~48 cases across 4 categories |
+| Protocol fuzzer — IKEv1 Aggressive Mode | Working — ~69 cases across 7 categories |
+| Protocol fuzzer — random byte-flip | Working — reproducible via `--seed`, IKEv1/v2 field-labelled |
 | strongSwan Docker test environment | Available — `docker/` subdirectory |
 
 ## Files
@@ -26,7 +28,7 @@ authentication, plus a structured protocol fuzzer.
 | File | Purpose |
 |------|---------|
 | `ike_client.py` | IKEv1 / IKEv2 client — select with `--version 1` or `--version 2` |
-| `ike_fuzzer.py` | Protocol fuzzer — structured and random mutations of IKE_SA_INIT |
+| `ike_fuzzer.py` | Protocol fuzzer — IKEv1 and IKEv2 structured and random mutations |
 | `requirements.txt` | Python dependencies |
 | `docker/` | strongSwan 5.9 responder for local testing (see below) |
 
@@ -467,15 +469,23 @@ HASH_R = prf(SKEYID, g^xr | g^xi | CKY-R | CKY-I | SAi_b | IDir_b)
 
 ---
 
-## IKEv2 Fuzzer
+## Fuzzer
 
-Builds a valid `IKE_SA_INIT` packet and applies structured and random mutations
-to probe how a responder handles malformed input.
+Builds a valid Phase 1 packet and applies structured and random mutations to probe
+how a responder handles malformed input. Supports IKEv1 (Main Mode and Aggressive
+Mode) and IKEv2.
 
 ### Basic usage
 
 ```bash
+# IKEv2 (default)
 venv/bin/python ike_fuzzer.py <host> [options]
+
+# IKEv1 Main Mode
+venv/bin/python ike_fuzzer.py <host> --ike-version 1 --mode main [options]
+
+# IKEv1 Aggressive Mode
+venv/bin/python ike_fuzzer.py <host> --ike-version 1 --mode aggressive [options]
 ```
 
 ### Options
@@ -484,18 +494,25 @@ venv/bin/python ike_fuzzer.py <host> [options]
 positional:
   host                  Responder IP address or hostname
 
+version / mode:
+  --ike-version {1,2}   IKE version to fuzz (default: 2)
+  --mode {main,aggressive}
+                        IKEv1 Phase 1 mode (default: main; ignored for IKEv2)
+
 fuzzing:
-  --strategy LIST       Comma-separated strategies (default: all)
-                          header, sa, ke, nonce, payload, truncate, random
+  --strategy LIST       Comma-separated strategies (default: all for chosen version)
   --rounds N            Random-mutation cases (default: 20; 0 = disable)
   --seed N              RNG seed for reproducibility (default: 1337)
   --delay SECONDS       Delay between sends (default: 0.05)
   --timeout SECONDS     Per-case response timeout (default: 2.0)
 
-base packet:
+IKEv2 algorithm options:
   --encr / --prf / --integ / --dh-group / --psk
-                        Algorithm options for the base valid packet
-                        (same choices as ike_client.py)
+
+IKEv1 algorithm options:
+  --v1-encr ALG         Encryption (default: aes-cbc-256)
+  --hash ALG            Hash/PRF algorithm (default: sha1)
+  --dh-group N / --psk
 
 output:
   --report FILE         Save JSON results to FILE
@@ -503,7 +520,7 @@ output:
   --no-color            Disable ANSI colour output
 ```
 
-### Mutation strategies
+### IKEv2 mutation strategies
 
 | Strategy | Cases | What is mutated |
 |----------|------:|-----------------|
@@ -511,11 +528,37 @@ output:
 | `sa` | 13 | Transforms: empty, unknown IDs, DH mismatch, wrong protocol, missing PRF/DH, two proposals, key-length extremes (0 / 65535), duplicates, critical bit |
 | `ke` | 8 | DH group field; public key (zeros, 0xFF, empty, 1 byte, half-length, one-byte-short) |
 | `nonce` | 5 | Size and content (empty, 1 byte, zeros, all-0xFF, 2 KiB) |
-| `payload` | 13 | next_payload pointers, missing SA/KE/Nonce, duplicated payloads, payload order swap (SA/Nonce/KE), unknown type appended, length overflow |
+| `payload` | 13 | next_payload pointers, missing SA/KE/Nonce, duplicated payloads, payload order swap, unknown type appended, length overflow |
 | `truncate` | 10 | Packet truncated at 4, 20, 27, 28, 32, 60, 94, 188, 372, 375 bytes |
-| `random` | `--rounds` | 1–4 random byte flips at random offsets (annotated with field names) |
+| `random` | `--rounds` | 1–4 random byte flips at random offsets, annotated with field names |
 
-Total structured cases: **66** (before random rounds).
+Total IKEv2 structured cases: **66** (before random rounds).
+
+### IKEv1 mutation strategies
+
+**Main Mode** targets Message 1 (SA only):
+
+| Strategy | Cases | What is mutated |
+|----------|------:|-----------------|
+| `header` | 20 | Exchange type (Main/Aggressive/Info/Quick/IKEv2/unknown), version (0x00/0x20/0xFF), flags (encryption bit / all bits), message ID, total-length (0/±1/max), Cookie I (zeros), Cookie R (non-zero), next payload (0 / Hash) |
+| `sa` | 12 | DOI (0), Situation (0), protocol (AH), transform ID (255), auth method (RSA sig), DH mismatch, unknown hash, two proposals, no proposal, no transforms, SA length 0, duplicate transforms |
+| `payload` | 6 | No payloads, unknown next_payload, SA critical byte, SA length 0xFFFF, spurious Hash after SA, duplicate SA |
+| `truncate` | 10 | Truncated at 10 offsets |
+| `random` | `--rounds` | Random byte flips with IKEv1 field labels |
+
+Total IKEv1 Main Mode structured cases: **~48** (before random rounds).
+
+**Aggressive Mode** targets Message 1 (SA + KE + Nonce + IDii). Includes all Main
+Mode strategies plus:
+
+| Strategy | Cases | What is mutated |
+|----------|------:|-----------------|
+| `ke` | 6 | DH group (0 / 9999), public key (zeros, 0xFF, empty, half-length) |
+| `nonce` | 5 | Empty, 1 byte, zeros, all-0xFF, 1024 bytes |
+| `id` | 6 | ID type (0 / FQDN), empty data, wrong IP (0.0.0.0), length 0, missing IDii |
+| `payload` | 11 | Missing SA/KE/Nonce/ID, reordered payloads (SA→Nonce→KE→ID), spurious VendorID, no payloads, unknown next_payload, SA length 0xFFFF |
+
+Total IKEv1 Aggressive Mode structured cases: **~69** (before random rounds).
 
 ### Reading the output
 
@@ -523,91 +566,85 @@ Verdicts are colour-coded in the terminal:
 
 | Colour | Verdict | Meaning |
 |--------|---------|---------|
-| Green | `ACCEPTED` | Responder assigned an SPIr — SA offered |
-| Cyan | `REJECTED` | Error Notify present, or SPIr=0 with only informational notifies |
+| Green | `ACCEPTED` | Responder assigned a non-zero Cookie R / SPIr — handshake can continue |
+| Cyan | `REJECTED` | Error Notify (IKEv1: Informational exchange; IKEv2: error notify in response) |
 | Dark grey | `TIMEOUT` | No response within `--timeout` seconds |
-| Yellow | `INTERESTING` | Valid framing but genuinely ambiguous (SPIi mismatch, SPIr=0 with no notifies, wrong exchange type) |
+| Yellow | `INTERESTING` | Valid framing but unexpected — wrong exchange type, Cookie mismatch, or ambiguous SPIr=0 |
 | Red | `MALFORMED` | Response shorter than 28 bytes |
 
-Cases flagged `***` are those where the observed verdict differs from the expected
-column — these are written to the `findings` array of the JSON report.
+Cases flagged `***` differ from the expected column and are written to the
+`findings` array of the JSON report.
 
 ### Random mutation detail
 
-Each random case prints an annotated sub-line per flipped byte showing the
-packet offset, field name, original byte, and mutated byte:
+Each random case prints an annotated sub-line per flipped byte:
 
 ```
-  67  random  random-000  REJECTED  notify: MULTIPLE_AUTH_SUPPORTED
-        [ 33 SA-prop1 reserved]  0x00 → 0xce
-        [292 KE pubkey[208]]     0x57 → 0x54
-        [374 Nonce data[30]]     0x8b → 0xc4
+  70  random  v1-random-000  REJECTED  notify: INVALID_PAYLOAD_TYPE
+        [ 18 ISAKMP exchange-type]  0x04 → 0x91
+        [292 KE pubkey[223]]        0x3a → 0x7f
 ```
 
-Field names cover every byte in the IKE fixed header and all standard payload
-types (SA transforms, KE, Nonce). The same data appears in the `mutations` array
-of the JSON report.
+Field labels cover every byte in the ISAKMP/IKE header and all standard payload
+types (SA/KE/Nonce/ID for IKEv1; SA transforms/KE/Nonce for IKEv2).
 
 ### Examples
 
-Full run against the Docker responder, saving results:
+IKEv2 full run against the Docker responder:
 ```bash
 venv/bin/python ike_fuzzer.py 127.0.0.1 \
-    --psk secret \
-    --rounds 50 \
-    --report findings.json
+    --psk secret --rounds 50 --report findings_v2.json
 ```
 
-Header and SA mutations only, no random rounds:
+IKEv1 Main Mode, all strategies:
 ```bash
 venv/bin/python ike_fuzzer.py 127.0.0.1 \
-    --psk secret \
-    --strategy header,sa \
-    --rounds 0
+    --ike-version 1 --mode main \
+    --psk secret --rounds 20 --report findings_v1_main.json
 ```
 
-GCM base packet with P-521, all strategies:
+IKEv1 Aggressive Mode, all strategies:
 ```bash
 venv/bin/python ike_fuzzer.py 127.0.0.1 \
-    --encr aes-gcm-256 \
-    --prf hmac-sha512 \
-    --dh-group 21 \
-    --psk secret \
-    --rounds 50
+    --ike-version 1 --mode aggressive \
+    --psk secret --rounds 20 --report findings_v1_agg.json
 ```
 
-Reproducible random fuzzing with a fixed seed:
+IKEv1 Aggressive Mode, structured only, SHA-256 + DH-14:
 ```bash
 venv/bin/python ike_fuzzer.py 127.0.0.1 \
-    --rounds 100 \
-    --seed 42 \
-    --report run_seed42.json
+    --ike-version 1 --mode aggressive \
+    --hash sha256 --dh-group 14 \
+    --strategy header,sa,ke,nonce,id,payload,truncate \
+    --rounds 0 --delay 0
 ```
 
-Structured mutations only, maximum speed:
+IKEv2 GCM + P-521 with fixed seed:
 ```bash
 venv/bin/python ike_fuzzer.py 127.0.0.1 \
-    --strategy header,sa,ke,nonce,payload,truncate \
-    --rounds 0 \
-    --delay 0
+    --encr aes-gcm-256 --prf hmac-sha512 --dh-group 21 \
+    --psk secret --rounds 100 --seed 42 --report run_seed42.json
 ```
 
 ### JSON report format
 
-`--report` writes a JSON file with the following top-level structure:
+`--report` writes a JSON file. The top-level structure includes an `ike_version`
+and `mode` field for IKEv1 runs:
 
 ```json
 {
-  "target":    "127.0.0.1:500",
-  "timestamp": "2026-06-05T12:00:00",
-  "config":    { "encr": "aes-cbc-256", "prf": "hmac-sha256", "dh_group": 14, … },
-  "strategies": ["header", "sa", …],
-  "rounds":    100,
-  "seed":      1337,
-  "summary":   { "total": 166, "accepted": 1, "rejected": 154, "timeout": 11,
-                 "interesting_findings": 1 },
-  "findings":  [ … ],
-  "all":       [ … ]
+  "target":      "127.0.0.1:500",
+  "timestamp":   "2026-06-07T12:00:00",
+  "ike_version": 1,
+  "mode":        "aggressive",
+  "config":      { "encr": "aes-cbc-256", "hash": "sha1", "dh_group": 14, "psk": "***" },
+  "strategies":  ["header", "sa", "ke", "nonce", "id", "payload", "truncate", "random"],
+  "rounds":      20,
+  "seed":        1337,
+  "summary":     { "total": 89, "accepted": 1, "rejected": 65, "timeout": 21,
+                   "interesting_findings": 2 },
+  "findings":    [ … ],
+  "all":         [ … ]
 }
 ```
 
@@ -615,32 +652,37 @@ Each entry in `all` / `findings`:
 
 ```json
 {
-  "seq":         67,
-  "name":        "random-000",
-  "category":    "random",
-  "description": "Random flip: [33 SA-prop1 reserved] 0x00→0xce, …",
-  "pkt_len":     376,
-  "mutations": [
-    { "offset": 33, "field": "SA-prop1 reserved",
-      "original": "0x00", "modified": "0xce" }
-  ],
-  "expected":    "any",
-  "verdict":     "rejected",
-  "notify_type": 16390,
-  "notes":       "notify: MULTIPLE_AUTH_SUPPORTED",
-  "elapsed_ms":  1.23,
-  "interesting": false
+  "seq":         6,
+  "name":        "v1-version-zero",
+  "category":    "header",
+  "description": "Version = 0x00",
+  "pkt_len":     384,
+  "mutations":   [],
+  "expected":    "timeout",
+  "verdict":     "interesting",
+  "notify_type": null,
+  "notes":       "version 0x20",
+  "elapsed_ms":  1.45,
+  "interesting": true
 }
 ```
 
-### Known finding — strongSwan SPIr leniency
+### Known findings
 
-RFC 7296 §2.6 requires the responder SPI (SPIr) in an IKE_SA_INIT *request* to be
-all zeros. strongSwan 5.9 accepts the request and completes SA_INIT regardless.
-This surfaces as `ACCEPTED` on case `spi-r-nonzero` (header strategy) and on any
-random case that flips a byte in `IKE-hdr SPIr[N]` from `0x00` to non-zero. All
-other mutations across 166 cases with `--rounds 100` were correctly rejected or
-timed out.
+**strongSwan IKEv2 — SPIr leniency:** RFC 7296 §2.6 requires SPIr = 0 in an
+IKE_SA_INIT request. strongSwan 5.9 accepts and completes the exchange regardless.
+Surfaces as `ACCEPTED` on `spi-r-nonzero` and on any random case that flips an
+`IKE-hdr SPIr[N]` byte.
+
+**strongSwan IKEv1 — version byte leniency:** Version bytes `0x00` and `0xFF` both
+receive a response (strongSwan replies with its own version `0x20`). Marked
+`INTERESTING` because the response uses an unexpected version, not `TIMEOUT` as
+expected. Occurs in both Main and Aggressive Mode.
+
+**strongSwan IKEv1 Main Mode — malformed-length acceptance:** `total-length = 0`
+and `total-length = actual − 1` both result in `ACCEPTED` (SA response with a
+non-zero Cookie R). strongSwan appears to use the UDP datagram length rather than
+the ISAKMP length field when parsing.
 
 ---
 
