@@ -35,6 +35,14 @@ except ImportError:
     _TripleDES = cipher_algorithms.TripleDES   # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class AuthenticationError(ValueError):
+    """Raised when IKEv1 HASH_R or IKEv2 AUTH verification fails."""
+
+
+# ---------------------------------------------------------------------------
 # IKEv2 constants (RFC 7296 numeric values)
 # ---------------------------------------------------------------------------
 
@@ -1746,7 +1754,9 @@ class IKEv1Client:
         """Decrypt and verify HASH_R from message 6."""
         self._parse_isakmp_hdr(pkt, expected_exch=V1_EXCHANGE_MAIN)
         if not (pkt[19] & V1_FLAG_ENCRYPTION):
-            raise ValueError("Message 6 is not encrypted")
+            raise AuthenticationError(
+                "Cannot decrypt Main Mode message 6 — PSK is wrong or keys are corrupt"
+            )
         plaintext, _ = self._decrypt_v1(pkt[28:], iv)
         payloads = self._parse_payloads_v1(plaintext, pkt[16])
         self._log_payloads_v1(payloads)
@@ -2296,13 +2306,13 @@ class IKEv1Client:
         return h
 
     def _verify_hash_r(self, received: bytes) -> None:
-        """Recompute HASH_R and log whether it matches the received value."""
+        """Recompute HASH_R and raise AuthenticationError on mismatch."""
         expected = self._compute_hash_r()
         if received == expected:
             self.log.info("HASH_R: VERIFIED ✓")
         else:
-            self.log.warn(
-                f"HASH_R mismatch\n"
+            raise AuthenticationError(
+                f"HASH_R authentication failed — PSK is wrong or responder is not authentic\n"
                 f"  expected : {expected.hex()}\n"
                 f"  received : {received.hex()}"
             )
@@ -2738,6 +2748,9 @@ def main() -> None:
         client.run()
     except TimeoutError as e:
         print(f"\nTimeout: {e}", file=sys.stderr)
+        sys.exit(1)
+    except AuthenticationError as e:
+        print(f"\nAuthentication failed: {e}", file=sys.stderr)
         sys.exit(1)
     except NotImplementedError as e:
         print(f"\n[SCAFFOLD] Not yet implemented: {e}", file=sys.stderr)
