@@ -53,11 +53,12 @@ SoftEther implements **IKEv1 only** (no IKEv2).
 | AES-256-CBC | SHA-1 | 14 (MODP-2048) | ✓ | ✓ |
 | AES-256-CBC | SHA-256 | 14 (MODP-2048) | ✓ | ✓ |
 | AES-128-CBC | SHA-1 | 14 (MODP-2048) | ✓ | ✓ |
-| 3DES | SHA-1 | 14 (MODP-2048) | ✗ rejected | ✗ rejected |
-| AES-256-CBC | SHA-1 | 2 (MODP-1024) | ✗ rejected | ✗ rejected |
+| 3DES | SHA-1 | 14 (MODP-2048) | ✓ | ✓ |
+| AES-256-CBC | SHA-1 | 2 (MODP-1024) | ✓ | ✓ |
+| 3DES | SHA-1 | 2 (MODP-1024) | ✗ rejected | ✗ rejected |
 
-> **Note:** SoftEther 4.44 requires DH group 14 (MODP-2048). Weaker groups
-> (MODP-1024/768) and 3DES are rejected with an Informational exchange.
+> **Note:** SoftEther 4.44 rejects the combination of 3DES + MODP-1024 (group 2).
+> Each algorithm works individually with group 14; group 2 works with AES but not 3DES.
 
 ```bash
 # Main Mode
@@ -89,8 +90,9 @@ python ike_fuzzer.py 127.0.0.1 --ike-version 1 --mode aggressive \
 
 ## Notes
 
-- SoftEther does not support IKEv2, ECDH groups (19/20/21), AES-GCM, or 3DES.
-- SoftEther 4.44 enforces MODP-2048 (group 14) as the minimum DH group; groups 1/2/5 are rejected.
+- SoftEther does not support IKEv2, ECDH groups (19/20/21), or AES-GCM.
+- The combination of 3DES + DH group 2 (MODP-1024) is rejected; each works individually with other groups.
+- SoftEther's IKEv1 parser is highly permissive — see the fuzzing findings in the main README.
 - Phase 1 completes successfully; Phase 2 / L2TP are not exercised by ike_client.py.
 - The management password is set to `admin` at startup and is only needed for
   internal administration via `vpncmd`.

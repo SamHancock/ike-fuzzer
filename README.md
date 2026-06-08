@@ -692,20 +692,60 @@ Each entry in `all` / `findings`:
 
 ### Known findings
 
-**strongSwan IKEv2 — SPIr leniency:** RFC 7296 §2.6 requires SPIr = 0 in an
-IKE_SA_INIT request. strongSwan 5.9 accepts and completes the exchange regardless.
-Surfaces as `ACCEPTED` on `spi-r-nonzero` and on any random case that flips an
+#### strongSwan 5.9
+
+**IKEv2 — SPIr leniency:** RFC 7296 §2.6 requires SPIr = 0 in an IKE_SA_INIT
+request. strongSwan accepts and completes the exchange regardless. Surfaces as
+`ACCEPTED` on `spi-r-nonzero` and on any random case that flips an
 `IKE-hdr SPIr[N]` byte.
 
-**strongSwan IKEv1 — version byte leniency:** Version bytes `0x00` and `0xFF` both
-receive a response (strongSwan replies with its own version `0x20`). Marked
-`INTERESTING` because the response uses an unexpected version, not `TIMEOUT` as
-expected. Occurs in both Main and Aggressive Mode.
+**IKEv1 — version byte leniency:** Version bytes `0x00` and `0xFF` both receive
+a response (strongSwan replies with its own version `0x20`). Marked `INTERESTING`
+rather than `TIMEOUT`. Occurs in both Main and Aggressive Mode.
 
-**strongSwan IKEv1 Main Mode — malformed-length acceptance:** `total-length = 0`
-and `total-length = actual − 1` both result in `ACCEPTED` (SA response with a
-non-zero Cookie R). strongSwan appears to use the UDP datagram length rather than
-the ISAKMP length field when parsing.
+**IKEv1 Main Mode — malformed-length acceptance:** `total-length = 0` and
+`total-length = actual − 1` both result in `ACCEPTED`. strongSwan appears to use
+the UDP datagram length rather than the ISAKMP length field when parsing.
+
+#### SoftEther VPN 4.44
+
+SoftEther's IKEv1 parser is significantly more permissive than strongSwan's,
+accepting many malformed Main Mode messages that should be rejected. All 11
+findings below were confirmed `ACCEPTED` (non-zero Cookie R returned) against
+`docker/softether` with the structured fuzzer (`--rounds 0`):
+
+| Case | Category | Expectation | SoftEther verdict |
+|------|----------|-------------|-------------------|
+| `v1-version-zero` | header | timeout | **ACCEPTED** |
+| `v1-version-ikev2` | header | timeout | **ACCEPTED** |
+| `v1-version-ff` | header | timeout | **ACCEPTED** |
+| `v1-msg-id-nonzero` | header | any | **ACCEPTED** |
+| `v1-msg-id-max` | header | timeout | **ACCEPTED** |
+| `v1-sa-dh-mismatch` | sa | rejected | **ACCEPTED** |
+| `v1-sa-two-proposals` | sa | any | **ACCEPTED** |
+| `v1-sa-dup-transform` | sa | any | **ACCEPTED** |
+| `v1-chain-sa-critical` | payload | any | **ACCEPTED** |
+| `v1-chain-spurious-hash` | payload | any | **ACCEPTED** |
+| `v1-chain-dup-sa` | payload | any | **ACCEPTED** |
+
+**Version byte ignored entirely:** SoftEther accepts `0x00`, `0x20` (IKEv2), and
+`0xFF` equally — it does not validate the ISAKMP version field at all.
+
+**Message ID not validated:** RFC 2408 §3.1 requires Message ID = 0 for Phase 1
+message 1. SoftEther accepts any 32-bit value including `0x00000001` and
+`0xFFFFFFFF`.
+
+**DH group mismatch accepted:** The SA payload proposed DH group 5 (MODP-1536)
+while the KE payload carried a DH-14 (MODP-2048) public key. SoftEther completed
+the exchange, apparently using the KE payload's group unconditionally.
+
+**Duplicate SA payload accepted:** A chain with two identical SA payloads before
+the KE payload was accepted without error.
+
+**Aggressive Mode — empty and half-length KE public keys accepted:** Both
+`v1-ke-pubkey-empty` (0-byte public key) and `v1-ke-pubkey-half` (128-byte key
+for a 256-byte MODP-2048 group) resulted in `ACCEPTED` — SoftEther completed the
+Aggressive Mode exchange despite the cryptographically invalid KE data.
 
 ---
 
