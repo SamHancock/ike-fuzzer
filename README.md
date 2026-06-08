@@ -694,18 +694,69 @@ Each entry in `all` / `findings`:
 
 #### strongSwan 5.9
 
-**IKEv2 — SPIr leniency:** RFC 7296 §2.6 requires SPIr = 0 in an IKE_SA_INIT
-request. strongSwan accepts and completes the exchange regardless. Surfaces as
-`ACCEPTED` on `spi-r-nonzero` and on any random case that flips an
-`IKE-hdr SPIr[N]` byte.
+Exhaustive testing covered all algorithm combinations supported by the Docker
+config (5 IKEv1 Main proposals, 4 IKEv1 Aggressive proposals, 4 IKEv2 proposals)
+plus systematic rejection tests for unsupported combinations. All proposals
+accepted/rejected exactly as configured. Fuzzer ran 166 IKEv2 cases, 148 IKEv1
+Main Mode cases, and 169 IKEv1 Aggressive Mode cases — each with 100 random rounds
+(`--seed 1337`).
 
-**IKEv1 — version byte leniency:** Version bytes `0x00` and `0xFF` both receive
-a response (strongSwan replies with its own version `0x20`). Marked `INTERESTING`
-rather than `TIMEOUT`. Occurs in both Main and Aggressive Mode.
+**IKEv1 Aggressive Mode — proposal cross-matching:** AES-128-CBC + SHA-1 + DH-14
+was accepted in Aggressive Mode even though the `ikev1-agg` connection lists only
+AES-256-CBC proposals. strongSwan matched the exchange against `ikev1-main`'s
+broader proposal list regardless of exchange mode.
 
-**IKEv1 Main Mode — malformed-length acceptance:** `total-length = 0` and
-`total-length = actual − 1` both result in `ACCEPTED`. strongSwan appears to use
-the UDP datagram length rather than the ISAKMP length field when parsing.
+**IKEv2 — SPIr leniency (confirmed, extended):** RFC 7296 §2.6 requires SPIr = 0
+in an IKE_SA_INIT request. strongSwan accepts regardless. All 8 random accepted
+IKEv2 cases share an `IKE-hdr SPIr[N]` mutation — SPIr leniency is the sole
+driver of IKEv2 random acceptance.
+
+**IKEv2 — length-zero accepted:** `total-length = 0` in the IKE header accepted
+(SA_INIT completes). strongSwan uses UDP datagram length rather than the header
+field.
+
+**IKEv1 — version byte leniency:** Version bytes `0x00` and `0xFF` both receive a
+response (strongSwan replies with its own version `0x20`). Marked `INTERESTING`
+rather than `TIMEOUT`. Occurs in both Main and Aggressive Mode; also triggered by
+any random flip of the version byte regardless of other mutations.
+
+**IKEv1 Main Mode — length field ignored (three cases):** `total-length = 0`,
+`total-length = actual − 1`, and `total-length = actual + 1` all result in
+`ACCEPTED`. strongSwan uses UDP datagram length rather than the ISAKMP length
+field in all three directions.
+
+**IKEv1 Main Mode — duplicate transform accepted:** A proposal containing two
+identical transforms (`v1-sa-dup-transform`) is accepted.
+
+**IKEv1 Main Mode — SA reserved byte accepted:** Setting the reserved byte of the
+SA generic header to `0x80` (`v1-chain-sa-critical`) is accepted without error.
+
+**IKEv1 Main Mode — SA DOI upper bytes not validated:** Random cases show that the
+upper 3 bytes of the 32-bit DOI field can be non-zero and the exchange is still
+accepted. Only the LSB (the value `0x01` for IPsec DOI) appears to be checked.
+(Observed: DOI[0]=0x0a, DOI[1]=0xc1 accepted.)
+
+**IKEv1 Main Mode — SA Situation field partially validated:** Only the LSB of the
+4-byte Situation field is checked. Changing higher bytes (Situation[3]) to
+arbitrary values while leaving the LSB at `0x01` is accepted. (Observed:
+Situation[3]=0x26, 0xb6 accepted.)
+
+**IKEv1 Main Mode — transform attributes loosely parsed:** Attribute value bytes
+within transform TV pairs (auth method, group, life type/duration) can be mutated
+and the exchange still completes, suggesting strongSwan selects the transform based
+on the SA proposal match earlier in parsing and does not strictly re-validate
+attribute values.
+
+**IKEv1 Main Mode — proposal number arbitrary:** Proposal number field changed
+from `0x01` to `0xbf` is accepted (confirmed in random testing, consistent with
+SoftEther finding).
+
+**IKEv1 Aggressive Mode — well-validated:** 0 accepted findings from 269 cases
+(169 structured + 100 random). All malformed packets either rejected or timed out.
+The only findings are version-byte responses (classified `INTERESTING`), consistent
+with Main Mode behaviour. strongSwan's Aggressive Mode parser is significantly
+stricter than its Main Mode parser — and unlike SoftEther, strongSwan correctly
+verifies HASH_I, rejecting any initiator with a wrong PSK.
 
 #### SoftEther VPN 4.44
 
