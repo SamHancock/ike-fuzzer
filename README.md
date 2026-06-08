@@ -709,18 +709,25 @@ the UDP datagram length rather than the ISAKMP length field when parsing.
 
 #### SoftEther VPN 4.44
 
-SoftEther's IKEv1 parser is significantly more permissive than strongSwan's,
-accepting many malformed Main Mode messages that should be rejected. All 11
-findings below were confirmed `ACCEPTED` (non-zero Cookie R returned) against
-`docker/softether` with the structured fuzzer (`--rounds 0`):
+Exhaustive testing covered 72 algorithm combinations (3 encr × 4 hash × 3 DH ×
+2 modes) — all 72 passed. The fuzzer ran 148 structured + 100 random cases in Main
+Mode and 169 structured + 100 random cases in Aggressive Mode. Findings below are
+all confirmed `ACCEPTED` (non-zero Cookie R returned).
 
-| Case | Category | Expectation | SoftEther verdict |
-|------|----------|-------------|-------------------|
+**Algorithm support:** SoftEther accepts every tested combination without
+restriction: AES-CBC-128, AES-CBC-256, 3DES with MD5, SHA-1, SHA-256, SHA-512
+over DH groups 2 (MODP-1024), 5 (MODP-1536), and 14 (MODP-2048) in both Main
+and Aggressive Mode.
+
+##### Main Mode — structured findings (11 cases)
+
+| Case | Category | Expected | Verdict |
+|------|----------|----------|---------|
 | `v1-version-zero` | header | timeout | **ACCEPTED** |
-| `v1-version-ikev2` | header | timeout | **ACCEPTED** |
+| `v1-version-ikev2` (0x20) | header | timeout | **ACCEPTED** |
 | `v1-version-ff` | header | timeout | **ACCEPTED** |
 | `v1-msg-id-nonzero` | header | any | **ACCEPTED** |
-| `v1-msg-id-max` | header | timeout | **ACCEPTED** |
+| `v1-msg-id-max` (0xFFFFFFFF) | header | timeout | **ACCEPTED** |
 | `v1-sa-dh-mismatch` | sa | rejected | **ACCEPTED** |
 | `v1-sa-two-proposals` | sa | any | **ACCEPTED** |
 | `v1-sa-dup-transform` | sa | any | **ACCEPTED** |
@@ -728,24 +735,64 @@ findings below were confirmed `ACCEPTED` (non-zero Cookie R returned) against
 | `v1-chain-spurious-hash` | payload | any | **ACCEPTED** |
 | `v1-chain-dup-sa` | payload | any | **ACCEPTED** |
 
-**Version byte ignored entirely:** SoftEther accepts `0x00`, `0x20` (IKEv2), and
-`0xFF` equally — it does not validate the ISAKMP version field at all.
+##### Main Mode — random mutation findings (17 additional cases)
 
-**Message ID not validated:** RFC 2408 §3.1 requires Message ID = 0 for Phase 1
-message 1. SoftEther accepts any 32-bit value including `0x00000001` and
-`0xFFFFFFFF`.
+Random byte-flip testing with 100 rounds (`--seed 1337`) produced 17 further
+accepted cases, surfacing four additional parser weaknesses:
 
-**DH group mismatch accepted:** The SA payload proposed DH group 5 (MODP-1536)
-while the KE payload carried a DH-14 (MODP-2048) public key. SoftEther completed
-the exchange, apparently using the KE payload's group unconditionally.
+- **Cookie I not validated:** Flipping any byte of the 8-byte Cookie I field is
+  accepted. SoftEther echoes back the modified cookie without checking it against
+  any session state. (Cases: random-016, -017, -022, -028, -038, -045, -050,
+  -070, -078, -080, -093.)
 
-**Duplicate SA payload accepted:** A chain with two identical SA payloads before
-the KE payload was accepted without error.
+- **Message ID byte-level leniency:** Individual bytes within the 4-byte Message
+  ID field are ignored even when the structured full-field tests above only covered
+  whole-word mutations. (Cases: random-002, -066, -074, -080.)
 
-**Aggressive Mode — empty and half-length KE public keys accepted:** Both
-`v1-ke-pubkey-empty` (0-byte public key) and `v1-ke-pubkey-half` (128-byte key
-for a 256-byte MODP-2048 group) resulted in `ACCEPTED` — SoftEther completed the
-Aggressive Mode exchange despite the cryptographically invalid KE data.
+- **Proposal number arbitrary:** The proposal number subfield (RFC 2408 §3.4) was
+  mutated to `0xbf` (191) and accepted. (Case: random-017.)
+
+- **Num-transforms field ignored:** The "number of transforms" field in the
+  proposal header was set to `0xb6` (182) while only one transform was present.
+  SoftEther parsed the single transform without complaining about the count
+  mismatch. (Case: random-084.)
+
+- **Transform attribute encoding ignored:** Clearing the high bit of a TV-format
+  attribute type byte (converting it from TV to TLV format) was accepted across
+  multiple attribute slots (Auth, Group, LifeType, LifeDur value). (Cases:
+  random-008, -016, -035, -038, -050, -066, -074, -084, -093.)
+
+##### Aggressive Mode — findings (2 cases)
+
+Aggressive Mode was substantially tighter (125 of 169 structured cases timed out,
+all 100 random cases rejected or timed out). Two structured cases were accepted:
+
+- **`v1-ke-pubkey-empty`**: 0-byte KE public key — SoftEther completes the
+  Aggressive Mode exchange with no DH key material from the initiator.
+- **`v1-ke-pubkey-half`**: 128-byte public key for a 256-byte MODP-2048 group —
+  SoftEther accepts the truncated key and completes the exchange.
+
+##### Critical: HASH_I not verified in Aggressive Mode
+
+SoftEther does not verify the initiator's HASH_I payload in Aggressive Mode
+message 3. A client authenticating with a completely wrong PSK still receives
+an `ISAKMP SA established` response:
+
+```
+# Observed behaviour — wrong PSK accepted by SoftEther in Aggressive Mode
+HASH_R mismatch (our client detects it, SoftEther doesn't care)
+SoftEther responds: SA established
+```
+
+This means SoftEther provides no mutual authentication in Aggressive Mode — the
+responder authenticates itself via HASH_R (visible in message 2), but the
+initiator's identity is never verified. Any client can complete Phase 1 regardless
+of the PSK it presents.
+
+This finding also revealed a bug in `ike_client.py`: `_verify_hash_r()` was
+logging a warning instead of raising an error, allowing the exchange to silently
+proceed with wrong keys. Fixed in commit `68550ea` — HASH_R mismatch now raises
+`AuthenticationError` and aborts immediately.
 
 ---
 
